@@ -15,6 +15,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	toolkit_web "github.com/prometheus/exporter-toolkit/web"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/prober"
@@ -48,12 +50,20 @@ func New(logger log.Logger, reg *prometheus.Registry, comp component.Component, 
 	registerProbes(mux, prober, logger)
 	registerProfiler(mux)
 
+	var h http.Handler
+	if options.enableH2C {
+		h2s := &http2.Server{}
+		h = h2c.NewHandler(mux, h2s)
+	} else {
+		h = mux
+	}
+
 	return &Server{
 		logger: log.With(logger, "service", "http/server", "component", comp.String()),
 		comp:   comp,
 		prober: prober,
 		mux:    mux,
-		srv:    &http.Server{Addr: options.listen, Handler: mux},
+		srv:    &http.Server{Addr: options.listen, Handler: h},
 		opts:   options,
 	}
 }
@@ -65,7 +75,14 @@ func (s *Server) ListenAndServe() error {
 	if err != nil {
 		return errors.Wrap(err, "server could not be started")
 	}
-	return errors.Wrap(toolkit_web.ListenAndServe(s.srv, s.opts.tlsConfigPath, s.logger), "serve HTTP and metrics")
+
+	flags := &toolkit_web.FlagConfig{
+		WebListenAddresses: &([]string{s.opts.listen}),
+		WebSystemdSocket:   ofBool(false),
+		WebConfigFile:      &s.opts.tlsConfigPath,
+	}
+
+	return errors.Wrap(toolkit_web.ListenAndServe(s.srv, flags, s.logger), "serve HTTP and metrics")
 }
 
 // Shutdown gracefully shuts down the server by waiting,
@@ -100,7 +117,6 @@ func (s *Server) Handle(pattern string, handler http.Handler) {
 
 func registerProfiler(mux *http.ServeMux) {
 	mux.HandleFunc("/debug/pprof/", pprof.Index)
-	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
 	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
 	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
 	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
@@ -120,4 +136,9 @@ func registerProbes(mux *http.ServeMux, p *prober.HTTPProbe, logger log.Logger) 
 		mux.Handle("/-/healthy", p.HealthyHandler(logger))
 		mux.Handle("/-/ready", p.ReadyHandler(logger))
 	}
+}
+
+// Helper for exporter toolkit FlagConfig.
+func ofBool(i bool) *bool {
+	return &i
 }

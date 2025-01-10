@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -20,12 +19,13 @@ import (
 	"text/template"
 	"time"
 
+	extflag "github.com/efficientgo/tools/extkingpin"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/oklog/run"
 	"github.com/oklog/ulid"
 	"github.com/olekukonko/tablewriter"
-	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -35,11 +35,13 @@ import (
 	"github.com/prometheus/prometheus/model/relabel"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
-
-	extflag "github.com/efficientgo/tools/extkingpin"
 	"golang.org/x/text/language"
 	"golang.org/x/text/message"
 	"gopkg.in/yaml.v3"
+
+	"github.com/thanos-io/objstore"
+	"github.com/thanos-io/objstore/client"
+	objstoretracing "github.com/thanos-io/objstore/tracing/opentracing"
 
 	v1 "github.com/thanos-io/thanos/pkg/api/blocks"
 	"github.com/thanos-io/thanos/pkg/block"
@@ -53,12 +55,12 @@ import (
 	extpromhttp "github.com/thanos-io/thanos/pkg/extprom/http"
 	"github.com/thanos-io/thanos/pkg/logging"
 	"github.com/thanos-io/thanos/pkg/model"
-	"github.com/thanos-io/thanos/pkg/objstore"
-	"github.com/thanos-io/thanos/pkg/objstore/client"
 	"github.com/thanos-io/thanos/pkg/prober"
+	"github.com/thanos-io/thanos/pkg/promclient"
 	"github.com/thanos-io/thanos/pkg/replicate"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	httpserver "github.com/thanos-io/thanos/pkg/server/http"
+	"github.com/thanos-io/thanos/pkg/shipper"
 	"github.com/thanos-io/thanos/pkg/store"
 	"github.com/thanos-io/thanos/pkg/ui"
 	"github.com/thanos-io/thanos/pkg/verifier"
@@ -107,28 +109,34 @@ type bucketVerifyConfig struct {
 }
 
 type bucketLsConfig struct {
-	output string
+	output        string
+	excludeDelete bool
 }
 
 type bucketWebConfig struct {
-	webRoutePrefix      string
-	webExternalPrefix   string
-	webPrefixHeaderName string
-	webDisableCORS      bool
-	interval            time.Duration
-	label               string
-	timeout             time.Duration
+	webRoutePrefix         string
+	webExternalPrefix      string
+	webPrefixHeaderName    string
+	webDisableCORS         bool
+	interval               time.Duration
+	label                  string
+	timeout                time.Duration
+	disableAdminOperations bool
 }
 
 type bucketReplicateConfig struct {
 	resolutions []time.Duration
+	compactMin  int
+	compactMax  int
 	compactions []int
-	matcherStrs []string
+	matcherStrs string
 	singleRun   bool
 }
 
 type bucketDownsampleConfig struct {
+	waitInterval          time.Duration
 	downsampleConcurrency int
+	blockFilesConcurrency int
 	dataDir               string
 	hashFunc              string
 }
@@ -146,9 +154,15 @@ type bucketRetentionConfig struct {
 }
 
 type bucketMarkBlockConfig struct {
-	details  string
-	marker   string
-	blockIDs []string
+	details      string
+	marker       string
+	blockIDs     []string
+	removeMarker bool
+}
+
+type bucketUploadBlocksConfig struct {
+	path   string
+	labels []string
 }
 
 func (tbc *bucketVerifyConfig) registerBucketVerifyFlag(cmd extkingpin.FlagClause) *bucketVerifyConfig {
@@ -168,6 +182,8 @@ func (tbc *bucketVerifyConfig) registerBucketVerifyFlag(cmd extkingpin.FlagClaus
 func (tbc *bucketLsConfig) registerBucketLsFlag(cmd extkingpin.FlagClause) *bucketLsConfig {
 	cmd.Flag("output", "Optional format in which to print each block's information. Options are 'json', 'wide' or a custom template.").
 		Short('o').Default("").StringVar(&tbc.output)
+	cmd.Flag("exclude-delete", "Exclude blocks marked for deletion.").
+		Default("false").BoolVar(&tbc.excludeDelete)
 	return tbc
 }
 
@@ -194,16 +210,22 @@ func (tbc *bucketWebConfig) registerBucketWebFlag(cmd extkingpin.FlagClause) *bu
 
 	cmd.Flag("timeout", "Timeout to download metadata from remote storage").Default("5m").DurationVar(&tbc.timeout)
 
-	cmd.Flag("label", "Prometheus label to use as timeline title").StringVar(&tbc.label)
+	cmd.Flag("label", "External block label to use as group title").StringVar(&tbc.label)
+
+	cmd.Flag("disable-admin-operations", "Disable UI/API admin operations like marking blocks for deletion and no compaction.").Default("false").BoolVar(&tbc.disableAdminOperations)
 	return tbc
 }
 
 func (tbc *bucketReplicateConfig) registerBucketReplicateFlag(cmd extkingpin.FlagClause) *bucketReplicateConfig {
 	cmd.Flag("resolution", "Only blocks with these resolutions will be replicated. Repeated flag.").Default("0s", "5m", "1h").HintAction(listResLevel).DurationListVar(&tbc.resolutions)
 
-	cmd.Flag("compaction", "Only blocks with these compaction levels will be replicated. Repeated flag.").Default("1", "2", "3", "4").IntsVar(&tbc.compactions)
+	cmd.Flag("compaction-min", "Only blocks with at least this compaction level will be replicated.").Default("1").IntVar(&tbc.compactMin)
 
-	cmd.Flag("matcher", "Only blocks whose external labels exactly match this matcher will be replicated.").PlaceHolder("key=\"value\"").StringsVar(&tbc.matcherStrs)
+	cmd.Flag("compaction-max", "Only blocks up to a maximum of this compaction level will be replicated.").Default("4").IntVar(&tbc.compactMax)
+
+	cmd.Flag("compaction", "Only blocks with these compaction levels will be replicated. Repeated flag. Overrides compaction-min and compaction-max if set.").Default().IntsVar(&tbc.compactions)
+
+	cmd.Flag("matcher", "blocks whose external labels match this matcher will be replicated. All Prometheus matchers are supported, including =, !=, =~ and !~.").StringVar(&tbc.matcherStrs)
 
 	cmd.Flag("single-run", "Run replication only one time, then exit.").Default("false").BoolVar(&tbc.singleRun)
 
@@ -221,8 +243,12 @@ func (tbc *bucketRewriteConfig) registerBucketRewriteFlag(cmd extkingpin.FlagCla
 }
 
 func (tbc *bucketDownsampleConfig) registerBucketDownsampleFlag(cmd extkingpin.FlagClause) *bucketDownsampleConfig {
+	cmd.Flag("wait-interval", "Wait interval between downsample runs.").
+		Default("5m").DurationVar(&tbc.waitInterval)
 	cmd.Flag("downsample.concurrency", "Number of goroutines to use when downsampling blocks.").
 		Default("1").IntVar(&tbc.downsampleConcurrency)
+	cmd.Flag("block-files-concurrency", "Number of goroutines to use when fetching/uploading block files from object storage.").
+		Default("1").IntVar(&tbc.blockFilesConcurrency)
 	cmd.Flag("data-dir", "Data directory in which to cache blocks and process downsamplings.").
 		Default("./data").StringVar(&tbc.dataDir)
 	cmd.Flag("hash-func", "Specify which hash function to use when calculating the hashes of produced files. If no function has been specified, it does not happen. This permits avoiding downloading some files twice albeit at some performance cost. Possible values are: \"\", \"SHA256\".").
@@ -233,9 +259,9 @@ func (tbc *bucketDownsampleConfig) registerBucketDownsampleFlag(cmd extkingpin.F
 
 func (tbc *bucketMarkBlockConfig) registerBucketMarkBlockFlag(cmd extkingpin.FlagClause) *bucketMarkBlockConfig {
 	cmd.Flag("id", "ID (ULID) of the blocks to be marked for deletion (repeated flag)").Required().StringsVar(&tbc.blockIDs)
-	cmd.Flag("marker", "Marker to be put.").Required().EnumVar(&tbc.marker, metadata.DeletionMarkFilename, metadata.NoCompactMarkFilename)
-	cmd.Flag("details", "Human readable details to be put into marker.").Required().StringVar(&tbc.details)
-
+	cmd.Flag("marker", "Marker to be put.").Required().EnumVar(&tbc.marker, metadata.DeletionMarkFilename, metadata.NoCompactMarkFilename, metadata.NoDownsampleMarkFilename)
+	cmd.Flag("details", "Human readable details to be put into marker.").StringVar(&tbc.details)
+	cmd.Flag("remove", "Remove the marker.").Default("false").BoolVar(&tbc.removeMarker)
 	return tbc
 }
 
@@ -258,6 +284,13 @@ func (tbc *bucketRetentionConfig) registerBucketRetentionFlag(cmd extkingpin.Fla
 	return tbc
 }
 
+func (tbc *bucketUploadBlocksConfig) registerBucketUploadBlocksFlag(cmd extkingpin.FlagClause) *bucketUploadBlocksConfig {
+	cmd.Flag("path", "Path to the directory containing blocks to upload.").Default("./data").StringVar(&tbc.path)
+	cmd.Flag("label", "External labels to add to the uploaded blocks (repeated).").PlaceHolder("key=\"value\"").StringsVar(&tbc.labels)
+
+	return tbc
+}
+
 func registerBucket(app extkingpin.AppClause) {
 	cmd := app.Command("bucket", "Bucket utility commands")
 
@@ -272,6 +305,7 @@ func registerBucket(app extkingpin.AppClause) {
 	registerBucketMarkBlock(cmd, objStoreConfig)
 	registerBucketRewrite(cmd, objStoreConfig)
 	registerBucketRetention(cmd, objStoreConfig)
+	registerBucketUploadBlocks(cmd, objStoreConfig)
 }
 
 func registerBucketVerify(app extkingpin.AppClause, objStoreConfig *extflag.PathOrContent) {
@@ -293,11 +327,12 @@ func registerBucketVerify(app extkingpin.AppClause, objStoreConfig *extflag.Path
 			return err
 		}
 
-		bkt, err := client.NewBucket(logger, confContentYaml, reg, component.Bucket.String())
+		bkt, err := client.NewBucket(logger, confContentYaml, component.Bucket.String(), nil)
 		if err != nil {
 			return err
 		}
-		defer runutil.CloseWithLogOnErr(logger, bkt, "bucket client")
+		insBkt := objstoretracing.WrapWithTraces(objstore.WrapWithMetrics(bkt, extprom.WrapRegistererWithPrefix("thanos_", reg), bkt.Name()))
+		defer runutil.CloseWithLogOnErr(logger, insBkt, "bucket client")
 
 		backupconfContentYaml, err := objStoreBackupConfig.Content()
 		if err != nil {
@@ -311,10 +346,11 @@ func registerBucketVerify(app extkingpin.AppClause, objStoreConfig *extflag.Path
 			}
 		} else {
 			// nil Prometheus registerer: don't create conflicting metrics.
-			backupBkt, err = client.NewBucket(logger, backupconfContentYaml, nil, component.Bucket.String())
+			backupBkt, err = client.NewBucket(logger, backupconfContentYaml, component.Bucket.String(), nil)
 			if err != nil {
 				return err
 			}
+			insBkt = objstoretracing.WrapWithTraces(objstore.WrapWithMetrics(bkt, nil, bkt.Name()))
 
 			defer runutil.CloseWithLogOnErr(logger, backupBkt, "backup bucket client")
 		}
@@ -327,7 +363,10 @@ func registerBucketVerify(app extkingpin.AppClause, objStoreConfig *extflag.Path
 			return err
 		}
 
-		fetcher, err := block.NewMetaFetcher(logger, block.FetcherConcurrency, bkt, "", extprom.WrapRegistererWithPrefix(extpromPrefix, reg), nil, nil)
+		// We ignore any block that has the deletion marker file.
+		filters := []block.MetadataFilter{block.NewIgnoreDeletionMarkFilter(logger, insBkt, 0, block.FetcherConcurrency)}
+		baseBlockIDsFetcher := block.NewConcurrentLister(logger, insBkt)
+		fetcher, err := block.NewMetaFetcher(logger, block.FetcherConcurrency, insBkt, baseBlockIDsFetcher, "", extprom.WrapRegistererWithPrefix(extpromPrefix, reg), filters)
 		if err != nil {
 			return err
 		}
@@ -351,7 +390,7 @@ func registerBucketVerify(app extkingpin.AppClause, objStoreConfig *extflag.Path
 			}
 		}
 
-		v := verifier.NewManager(reg, logger, bkt, backupBkt, fetcher, time.Duration(*deleteDelay), r)
+		v := verifier.NewManager(reg, logger, insBkt, backupBkt, fetcher, time.Duration(*deleteDelay), r)
 		if tbc.repair {
 			return v.VerifyAndRepair(context.Background(), idMatcher)
 		}
@@ -372,12 +411,20 @@ func registerBucketLs(app extkingpin.AppClause, objStoreConfig *extflag.PathOrCo
 			return err
 		}
 
-		bkt, err := client.NewBucket(logger, confContentYaml, reg, component.Bucket.String())
+		bkt, err := client.NewBucket(logger, confContentYaml, component.Bucket.String(), nil)
 		if err != nil {
 			return err
 		}
+		insBkt := objstoretracing.WrapWithTraces(objstore.WrapWithMetrics(bkt, extprom.WrapRegistererWithPrefix("thanos_", reg), bkt.Name()))
 
-		fetcher, err := block.NewMetaFetcher(logger, block.FetcherConcurrency, bkt, "", extprom.WrapRegistererWithPrefix(extpromPrefix, reg), nil, nil)
+		var filters []block.MetadataFilter
+
+		if tbc.excludeDelete {
+			ignoreDeletionMarkFilter := block.NewIgnoreDeletionMarkFilter(logger, insBkt, 0, block.FetcherConcurrency)
+			filters = append(filters, ignoreDeletionMarkFilter)
+		}
+		baseBlockIDsFetcher := block.NewConcurrentLister(logger, insBkt)
+		fetcher, err := block.NewMetaFetcher(logger, block.FetcherConcurrency, insBkt, baseBlockIDsFetcher, "", extprom.WrapRegistererWithPrefix(extpromPrefix, reg), filters)
 		if err != nil {
 			return err
 		}
@@ -385,7 +432,7 @@ func registerBucketLs(app extkingpin.AppClause, objStoreConfig *extflag.PathOrCo
 		// Dummy actor to immediately kill the group after the run function returns.
 		g.Add(func() error { return nil }, func(error) {})
 
-		defer runutil.CloseWithLogOnErr(logger, bkt, "bucket client")
+		defer runutil.CloseWithLogOnErr(logger, insBkt, "bucket client")
 
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
@@ -408,7 +455,7 @@ func registerBucketLs(app extkingpin.AppClause, objStoreConfig *extflag.PathOrCo
 				maxTime := time.Unix(m.MaxTime/1000, 0)
 
 				if _, err = fmt.Fprintf(os.Stdout, "%s -- %s - %s Diff: %s, Compaction: %d, Downsample: %d, Source: %s\n",
-					m.ULID, minTime.Format("2006-01-02 15:04"), maxTime.Format("2006-01-02 15:04"), maxTime.Sub(minTime),
+					m.ULID, minTime.Format(time.RFC3339), maxTime.Format(time.RFC3339), maxTime.Sub(minTime),
 					m.Compaction.Level, m.Thanos.Downsample.Resolution, m.Thanos.Source); err != nil {
 					return err
 				}
@@ -472,12 +519,14 @@ func registerBucketInspect(app extkingpin.AppClause, objStoreConfig *extflag.Pat
 			return err
 		}
 
-		bkt, err := client.NewBucket(logger, confContentYaml, reg, component.Bucket.String())
+		bkt, err := client.NewBucket(logger, confContentYaml, component.Bucket.String(), nil)
 		if err != nil {
 			return err
 		}
+		insBkt := objstoretracing.WrapWithTraces(objstore.WrapWithMetrics(bkt, extprom.WrapRegistererWithPrefix("thanos_", reg), bkt.Name()))
 
-		fetcher, err := block.NewMetaFetcher(logger, block.FetcherConcurrency, bkt, "", extprom.WrapRegistererWithPrefix(extpromPrefix, reg), nil, nil)
+		baseBlockIDsFetcher := block.NewConcurrentLister(logger, insBkt)
+		fetcher, err := block.NewMetaFetcher(logger, block.FetcherConcurrency, insBkt, baseBlockIDsFetcher, "", extprom.WrapRegistererWithPrefix(extpromPrefix, reg), nil)
 		if err != nil {
 			return err
 		}
@@ -485,7 +534,7 @@ func registerBucketInspect(app extkingpin.AppClause, objStoreConfig *extflag.Pat
 		// Dummy actor to immediately kill the group after the run function returns.
 		g.Add(func() error { return nil }, func(error) {})
 
-		defer runutil.CloseWithLogOnErr(logger, bkt, "bucket client")
+		defer runutil.CloseWithLogOnErr(logger, insBkt, "bucket client")
 
 		ctx, cancel := context.WithTimeout(context.Background(), tbc.timeout)
 		defer cancel()
@@ -570,8 +619,8 @@ func registerBucketWeb(app extkingpin.AppClause, objStoreConfig *extflag.PathOrC
 
 		ins := extpromhttp.NewInstrumentationMiddleware(reg, nil)
 
-		bucketUI := ui.NewBucketUI(logger, tbc.label, tbc.webExternalPrefix, tbc.webPrefixHeaderName, "", component.Bucket)
-		bucketUI.Register(router, true, ins)
+		bucketUI := ui.NewBucketUI(logger, tbc.webExternalPrefix, tbc.webPrefixHeaderName, component.Bucket)
+		bucketUI.Register(router, ins)
 
 		flagsMap := getFlagsMap(cmd.Flags())
 
@@ -580,12 +629,13 @@ func registerBucketWeb(app extkingpin.AppClause, objStoreConfig *extflag.PathOrC
 			return err
 		}
 
-		bkt, err := client.NewBucket(logger, confContentYaml, reg, component.Bucket.String())
+		bkt, err := client.NewBucket(logger, confContentYaml, component.Bucket.String(), nil)
 		if err != nil {
 			return errors.Wrap(err, "bucket client")
 		}
+		insBkt := objstoretracing.WrapWithTraces(objstore.WrapWithMetrics(bkt, extprom.WrapRegistererWithPrefix("thanos_", reg), bkt.Name()))
 
-		api := v1.NewBlocksAPI(logger, tbc.webDisableCORS, tbc.label, flagsMap, bkt)
+		api := v1.NewBlocksAPI(logger, tbc.webDisableCORS, tbc.label, flagsMap, insBkt)
 
 		// Configure Request Logging for HTTP calls.
 		opts := []logging.Option{logging.WithDecider(func(_ string, _ error) logging.Decision {
@@ -619,24 +669,24 @@ func registerBucketWeb(app extkingpin.AppClause, objStoreConfig *extflag.PathOrC
 			return err
 		}
 		// TODO(bwplotka): Allow Bucket UI to visualize the state of block as well.
-		fetcher, err := block.NewMetaFetcher(logger, block.FetcherConcurrency, bkt, "", extprom.WrapRegistererWithPrefix(extpromPrefix, reg),
+		baseBlockIDsFetcher := block.NewConcurrentLister(logger, insBkt)
+		fetcher, err := block.NewMetaFetcher(logger, block.FetcherConcurrency, insBkt, baseBlockIDsFetcher, "", extprom.WrapRegistererWithPrefix(extpromPrefix, reg),
 			[]block.MetadataFilter{
 				block.NewTimePartitionMetaFilter(filterConf.MinTime, filterConf.MaxTime),
 				block.NewLabelShardedMetaFilter(relabelConfig),
-				block.NewDeduplicateFilter(),
-			}, nil)
+				block.NewDeduplicateFilter(block.FetcherConcurrency),
+			})
 		if err != nil {
 			return err
 		}
 		fetcher.UpdateOnChange(func(blocks []metadata.Meta, err error) {
-			bucketUI.Set(blocks, err)
 			api.SetGlobal(blocks, err)
 		})
 
 		ctx, cancel := context.WithCancel(context.Background())
 		g.Add(func() error {
 			statusProber.Ready()
-			defer runutil.CloseWithLogOnErr(logger, bkt, "bucket client")
+			defer runutil.CloseWithLogOnErr(logger, insBkt, "bucket client")
 			return runutil.Repeat(tbc.interval, ctx.Done(), func() error {
 				return runutil.RetryWithLog(logger, time.Minute, ctx.Done(), func() error {
 					iterCtx, iterCancel := context.WithTimeout(ctx, tbc.timeout)
@@ -686,6 +736,7 @@ func registerBucketReplicate(app extkingpin.AppClause, objStoreConfig *extflag.P
 	maxTime := model.TimeOrDuration(cmd.Flag("max-time", "End of time range limit to replicate. Thanos Replicate will replicate only metrics, which happened earlier than this value. Option can be a constant time in RFC3339 format or time duration relative to current time, such as -1d or 2h45m. Valid duration units are ms, s, m, h, d, w, y.").
 		Default("9999-12-31T23:59:59Z"))
 	ids := cmd.Flag("id", "Block to be replicated to the destination bucket. IDs will be used to match blocks and other matchers will be ignored. When specified, this command will be run only once after successful replication. Repeated field").Strings()
+	ignoreMarkedForDeletion := cmd.Flag("ignore-marked-for-deletion", "Do not replicate blocks that have deletion mark.").Bool()
 
 	cmd.Setup(func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ <-chan struct{}, _ bool) error {
 		matchers, err := replicate.ParseFlagMatchers(tbc.matcherStrs)
@@ -696,6 +747,16 @@ func registerBucketReplicate(app extkingpin.AppClause, objStoreConfig *extflag.P
 		var resolutionLevels []compact.ResolutionLevel
 		for _, lvl := range tbc.resolutions {
 			resolutionLevels = append(resolutionLevels, compact.ResolutionLevel(lvl.Milliseconds()))
+		}
+
+		if len(tbc.compactions) == 0 {
+			if tbc.compactMin > tbc.compactMax {
+				return errors.New("compaction-min must be less than or equal to compaction-max")
+			}
+			tbc.compactions = []int{}
+			for compactionLevel := tbc.compactMin; compactionLevel <= tbc.compactMax; compactionLevel++ {
+				tbc.compactions = append(tbc.compactions, compactionLevel)
+			}
 		}
 
 		blockIDs := make([]ulid.ULID, 0, len(*ids))
@@ -724,6 +785,7 @@ func registerBucketReplicate(app extkingpin.AppClause, objStoreConfig *extflag.P
 			minTime,
 			maxTime,
 			blockIDs,
+			*ignoreMarkedForDeletion,
 		)
 	})
 }
@@ -736,7 +798,8 @@ func registerBucketDownsample(app extkingpin.AppClause, objStoreConfig *extflag.
 	tbc.registerBucketDownsampleFlag(cmd)
 
 	cmd.Setup(func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ <-chan struct{}, _ bool) error {
-		return RunDownsample(g, logger, reg, *httpAddr, *httpTLSConfig, time.Duration(*httpGracePeriod), tbc.dataDir, tbc.downsampleConcurrency, objStoreConfig, component.Downsample, metadata.HashFunc(tbc.hashFunc))
+		return RunDownsample(g, logger, reg, *httpAddr, *httpTLSConfig, time.Duration(*httpGracePeriod), tbc.dataDir,
+			tbc.waitInterval, tbc.downsampleConcurrency, tbc.blockFilesConcurrency, objStoreConfig, component.Downsample, metadata.HashFunc(tbc.hashFunc))
 	})
 }
 
@@ -763,10 +826,11 @@ func registerBucketCleanup(app extkingpin.AppClause, objStoreConfig *extflag.Pat
 			return err
 		}
 
-		bkt, err := client.NewBucket(logger, confContentYaml, reg, component.Cleanup.String())
+		bkt, err := client.NewBucket(logger, confContentYaml, component.Cleanup.String(), nil)
 		if err != nil {
 			return err
 		}
+		insBkt := objstoretracing.WrapWithTraces(objstore.WrapWithMetrics(bkt, extprom.WrapRegistererWithPrefix("thanos_", reg), bkt.Name()))
 
 		// Dummy actor to immediately kill the group after the run function returns.
 		g.Add(func() error { return nil }, func(error) {})
@@ -776,15 +840,16 @@ func registerBucketCleanup(app extkingpin.AppClause, objStoreConfig *extflag.Pat
 		// While fetching blocks, we filter out blocks that were marked for deletion by using IgnoreDeletionMarkFilter.
 		// The delay of deleteDelay/2 is added to ensure we fetch blocks that are meant to be deleted but do not have a replacement yet.
 		// This is to make sure compactor will not accidentally perform compactions with gap instead.
-		ignoreDeletionMarkFilter := block.NewIgnoreDeletionMarkFilter(logger, bkt, tbc.deleteDelay/2, block.FetcherConcurrency)
-		duplicateBlocksFilter := block.NewDeduplicateFilter()
-		blocksCleaner := compact.NewBlocksCleaner(logger, bkt, ignoreDeletionMarkFilter, tbc.deleteDelay, stubCounter, stubCounter)
+		ignoreDeletionMarkFilter := block.NewIgnoreDeletionMarkFilter(logger, insBkt, tbc.deleteDelay/2, tbc.blockSyncConcurrency)
+		duplicateBlocksFilter := block.NewDeduplicateFilter(tbc.blockSyncConcurrency)
+		blocksCleaner := compact.NewBlocksCleaner(logger, insBkt, ignoreDeletionMarkFilter, tbc.deleteDelay, stubCounter, stubCounter)
 
 		ctx := context.Background()
 
 		var sy *compact.Syncer
 		{
-			baseMetaFetcher, err := block.NewBaseFetcher(logger, block.FetcherConcurrency, bkt, "", extprom.WrapRegistererWithPrefix(extpromPrefix, reg))
+			baseBlockIDsFetcher := block.NewConcurrentLister(logger, insBkt)
+			baseMetaFetcher, err := block.NewBaseFetcher(logger, tbc.blockSyncConcurrency, insBkt, baseBlockIDsFetcher, "", extprom.WrapRegistererWithPrefix(extpromPrefix, reg))
 			if err != nil {
 				return errors.Wrap(err, "create meta fetcher")
 			}
@@ -794,18 +859,19 @@ func registerBucketCleanup(app extkingpin.AppClause, objStoreConfig *extflag.Pat
 					block.NewConsistencyDelayMetaFilter(logger, tbc.consistencyDelay, extprom.WrapRegistererWithPrefix(extpromPrefix, reg)),
 					ignoreDeletionMarkFilter,
 					duplicateBlocksFilter,
-				}, []block.MetadataModifier{block.NewReplicaLabelRemover(logger, make([]string, 0))},
+				},
 			)
 			sy, err = compact.NewMetaSyncer(
 				logger,
 				reg,
-				bkt,
+				insBkt,
 				cf,
 				duplicateBlocksFilter,
 				ignoreDeletionMarkFilter,
 				stubCounter,
 				stubCounter,
-				tbc.blockSyncConcurrency)
+				0,
+			)
 			if err != nil {
 				return errors.Wrap(err, "create syncer")
 			}
@@ -818,7 +884,7 @@ func registerBucketCleanup(app extkingpin.AppClause, objStoreConfig *extflag.Pat
 
 		level.Info(logger).Log("msg", "synced blocks done")
 
-		compact.BestEffortCleanAbortedPartialUploads(ctx, logger, sy.Partial(), bkt, stubCounter, stubCounter, stubCounter)
+		compact.BestEffortCleanAbortedPartialUploads(ctx, logger, sy.Partial(), insBkt, stubCounter, stubCounter, stubCounter)
 		if err := blocksCleaner.DeleteMarkedBlocks(ctx); err != nil {
 			return errors.Wrap(err, "error cleaning blocks")
 		}
@@ -902,8 +968,8 @@ func printBlockData(blockMetas []*metadata.Meta, selectorLabels labels.Labels, s
 		var line []string
 		line = append(line,
 			blockMeta.ULID.String(),
-			time.Unix(blockMeta.MinTime/1000, 0).Format("02-01-2006 15:04:05"),
-			time.Unix(blockMeta.MaxTime/1000, 0).Format("02-01-2006 15:04:05"),
+			time.Unix(blockMeta.MinTime/1000, 0).Format(time.RFC3339),
+			time.Unix(blockMeta.MaxTime/1000, 0).Format(time.RFC3339),
 			timeRange.String(),
 			untilDown,
 			p.Sprintf("%d", blockMeta.Stats.NumSeries),
@@ -948,12 +1014,12 @@ func getKeysAlphabetically(labels map[string]string) []string {
 // matchesSelector checks if blockMeta contains every label from
 // the selector with the correct value.
 func matchesSelector(blockMeta *metadata.Meta, selectorLabels labels.Labels) bool {
-	for _, l := range selectorLabels {
-		if v, ok := blockMeta.Thanos.Labels[l.Name]; !ok || v != l.Value {
-			return false
-		}
-	}
-	return true
+	matches := true
+	selectorLabels.Range(func(l labels.Label) {
+		val, ok := blockMeta.Thanos.Labels[l.Name]
+		matches = matches && ok && val == l.Value
+	})
+	return matches
 }
 
 // getIndex calculates the index of s in strs.
@@ -988,8 +1054,8 @@ func (t Table) Less(i, j int) bool {
 
 func compare(s1, s2 string) bool {
 	// Values can be either Time, Duration, comma-delimited integers or strings.
-	s1Time, s1Err := time.Parse("02-01-2006 15:04:05", s1)
-	s2Time, s2Err := time.Parse("02-01-2006 15:04:05", s2)
+	s1Time, s1Err := time.Parse(time.RFC3339, s1)
+	s2Time, s2Err := time.Parse(time.RFC3339, s2)
 	if s1Err != nil || s2Err != nil {
 		s1Duration, s1Err := time.ParseDuration(s1)
 		s2Duration, s2Err := time.ParseDuration(s2)
@@ -1018,10 +1084,11 @@ func registerBucketMarkBlock(app extkingpin.AppClause, objStoreConfig *extflag.P
 			return err
 		}
 
-		bkt, err := client.NewBucket(logger, confContentYaml, reg, component.Mark.String())
+		bkt, err := client.NewBucket(logger, confContentYaml, component.Mark.String(), nil)
 		if err != nil {
 			return err
 		}
+		insBkt := objstoretracing.WrapWithTraces(objstore.WrapWithMetrics(bkt, extprom.WrapRegistererWithPrefix("thanos_", reg), bkt.Name()))
 
 		var ids []ulid.ULID
 		for _, id := range tbc.blockIDs {
@@ -1032,16 +1099,31 @@ func registerBucketMarkBlock(app extkingpin.AppClause, objStoreConfig *extflag.P
 			ids = append(ids, u)
 		}
 
+		if !tbc.removeMarker && tbc.details == "" {
+			return errors.Errorf("required flag --details not provided")
+		}
+
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		g.Add(func() error {
 			for _, id := range ids {
+				if tbc.removeMarker {
+					err := block.RemoveMark(ctx, logger, insBkt, id, promauto.With(nil).NewCounter(prometheus.CounterOpts{}), tbc.marker)
+					if err != nil {
+						return errors.Wrapf(err, "remove mark %v for %v", id, tbc.marker)
+					}
+					continue
+				}
 				switch tbc.marker {
 				case metadata.DeletionMarkFilename:
-					if err := block.MarkForDeletion(ctx, logger, bkt, id, tbc.details, promauto.With(nil).NewCounter(prometheus.CounterOpts{})); err != nil {
+					if err := block.MarkForDeletion(ctx, logger, insBkt, id, tbc.details, promauto.With(nil).NewCounter(prometheus.CounterOpts{})); err != nil {
 						return errors.Wrapf(err, "mark %v for %v", id, tbc.marker)
 					}
 				case metadata.NoCompactMarkFilename:
-					if err := block.MarkForNoCompact(ctx, logger, bkt, id, metadata.ManualNoCompactReason, tbc.details, promauto.With(nil).NewCounter(prometheus.CounterOpts{})); err != nil {
+					if err := block.MarkForNoCompact(ctx, logger, insBkt, id, metadata.ManualNoCompactReason, tbc.details, promauto.With(nil).NewCounter(prometheus.CounterOpts{})); err != nil {
+						return errors.Wrapf(err, "mark %v for %v", id, tbc.marker)
+					}
+				case metadata.NoDownsampleMarkFilename:
+					if err := block.MarkForNoDownsample(ctx, logger, insBkt, id, metadata.ManualNoDownsampleReason, tbc.details, promauto.With(nil).NewCounter(prometheus.CounterOpts{})); err != nil {
 						return errors.Wrapf(err, "mark %v for %v", id, tbc.marker)
 					}
 				default:
@@ -1082,10 +1164,11 @@ func registerBucketRewrite(app extkingpin.AppClause, objStoreConfig *extflag.Pat
 			return err
 		}
 
-		bkt, err := client.NewBucket(logger, confContentYaml, reg, component.Rewrite.String())
+		bkt, err := client.NewBucket(logger, confContentYaml, component.Rewrite.String(), nil)
 		if err != nil {
 			return err
 		}
+		insBkt := objstoretracing.WrapWithTraces(objstore.WrapWithMetrics(bkt, extprom.WrapRegistererWithPrefix("thanos_", reg), bkt.Name()))
 
 		var modifiers []compactv2.Modifier
 
@@ -1137,12 +1220,12 @@ func registerBucketRewrite(app extkingpin.AppClause, objStoreConfig *extflag.Pat
 		ctx, cancel := context.WithCancel(context.Background())
 		g.Add(func() error {
 			chunkPool := chunkenc.NewPool()
-			changeLog := compactv2.NewChangeLog(ioutil.Discard)
+			changeLog := compactv2.NewChangeLog(io.Discard)
 			stubCounter := promauto.With(nil).NewCounter(prometheus.CounterOpts{})
 			for _, id := range ids {
 				// Delete series from block & modify.
 				level.Info(logger).Log("msg", "downloading block", "source", id)
-				if err := block.Download(ctx, logger, bkt, id, filepath.Join(tbc.tmpDir, id.String())); err != nil {
+				if err := block.Download(ctx, logger, insBkt, id, filepath.Join(tbc.tmpDir, id.String())); err != nil {
 					return errors.Wrapf(err, "download %v", id)
 				}
 
@@ -1214,18 +1297,18 @@ func registerBucketRewrite(app extkingpin.AppClause, objStoreConfig *extflag.Pat
 
 				level.Info(logger).Log("msg", "uploading new block", "source", id, "new", newID)
 				if tbc.promBlocks {
-					if err := block.UploadPromBlock(ctx, logger, bkt, filepath.Join(tbc.tmpDir, newID.String()), metadata.HashFunc(*hashFunc)); err != nil {
+					if err := block.UploadPromBlock(ctx, logger, insBkt, filepath.Join(tbc.tmpDir, newID.String()), metadata.HashFunc(*hashFunc)); err != nil {
 						return errors.Wrap(err, "upload")
 					}
 				} else {
-					if err := block.Upload(ctx, logger, bkt, filepath.Join(tbc.tmpDir, newID.String()), metadata.HashFunc(*hashFunc)); err != nil {
+					if err := block.Upload(ctx, logger, insBkt, filepath.Join(tbc.tmpDir, newID.String()), metadata.HashFunc(*hashFunc)); err != nil {
 						return errors.Wrap(err, "upload")
 					}
 				}
 				level.Info(logger).Log("msg", "uploaded", "source", id, "new", newID)
 
 				if !tbc.dryRun && tbc.deleteBlocks {
-					if err := block.MarkForDeletion(ctx, logger, bkt, id, "block rewritten", stubCounter); err != nil {
+					if err := block.MarkForDeletion(ctx, logger, insBkt, id, "block rewritten", stubCounter); err != nil {
 						level.Error(logger).Log("msg", "failed to mark block for deletion", "id", id.String(), "err", err)
 					}
 				}
@@ -1289,26 +1372,28 @@ func registerBucketRetention(app extkingpin.AppClause, objStoreConfig *extflag.P
 			return err
 		}
 
-		bkt, err := client.NewBucket(logger, confContentYaml, reg, component.Rewrite.String())
+		bkt, err := client.NewBucket(logger, confContentYaml, component.Retention.String(), nil)
 		if err != nil {
 			return err
 		}
+		insBkt := objstoretracing.WrapWithTraces(objstore.WrapWithMetrics(bkt, extprom.WrapRegistererWithPrefix("thanos_", reg), bkt.Name()))
 
 		// Dummy actor to immediately kill the group after the run function returns.
 		g.Add(func() error { return nil }, func(error) {})
 
-		defer runutil.CloseWithLogOnErr(logger, bkt, "bucket client")
+		defer runutil.CloseWithLogOnErr(logger, insBkt, "bucket client")
 
 		// While fetching blocks, we filter out blocks that were marked for deletion by using IgnoreDeletionMarkFilter.
 		// The delay of deleteDelay/2 is added to ensure we fetch blocks that are meant to be deleted but do not have a replacement yet.
 		// This is to make sure compactor will not accidentally perform compactions with gap instead.
-		ignoreDeletionMarkFilter := block.NewIgnoreDeletionMarkFilter(logger, bkt, tbc.deleteDelay/2, block.FetcherConcurrency)
-		duplicateBlocksFilter := block.NewDeduplicateFilter()
+		ignoreDeletionMarkFilter := block.NewIgnoreDeletionMarkFilter(logger, insBkt, tbc.deleteDelay/2, tbc.blockSyncConcurrency)
+		duplicateBlocksFilter := block.NewDeduplicateFilter(tbc.blockSyncConcurrency)
 		stubCounter := promauto.With(nil).NewCounter(prometheus.CounterOpts{})
 
 		var sy *compact.Syncer
 		{
-			baseMetaFetcher, err := block.NewBaseFetcher(logger, block.FetcherConcurrency, bkt, "", extprom.WrapRegistererWithPrefix(extpromPrefix, reg))
+			baseBlockIDsFetcher := block.NewConcurrentLister(logger, insBkt)
+			baseMetaFetcher, err := block.NewBaseFetcher(logger, tbc.blockSyncConcurrency, insBkt, baseBlockIDsFetcher, "", extprom.WrapRegistererWithPrefix(extpromPrefix, reg))
 			if err != nil {
 				return errors.Wrap(err, "create meta fetcher")
 			}
@@ -1318,18 +1403,19 @@ func registerBucketRetention(app extkingpin.AppClause, objStoreConfig *extflag.P
 					block.NewConsistencyDelayMetaFilter(logger, tbc.consistencyDelay, extprom.WrapRegistererWithPrefix(extpromPrefix, reg)),
 					duplicateBlocksFilter,
 					ignoreDeletionMarkFilter,
-				}, []block.MetadataModifier{block.NewReplicaLabelRemover(logger, make([]string, 0))},
+				},
 			)
 			sy, err = compact.NewMetaSyncer(
 				logger,
 				reg,
-				bkt,
+				insBkt,
 				cf,
 				duplicateBlocksFilter,
 				ignoreDeletionMarkFilter,
 				stubCounter,
 				stubCounter,
-				tbc.blockSyncConcurrency)
+				0,
+			)
 			if err != nil {
 				return errors.Wrap(err, "create syncer")
 			}
@@ -1345,9 +1431,60 @@ func registerBucketRetention(app extkingpin.AppClause, objStoreConfig *extflag.P
 
 		level.Warn(logger).Log("msg", "GLOBAL COMPACTOR SHOULD __NOT__ BE RUNNING ON THE SAME BUCKET")
 
-		if err := compact.ApplyRetentionPolicyByResolution(ctx, logger, bkt, sy.Metas(), retentionByResolution, stubCounter); err != nil {
+		if err := compact.ApplyRetentionPolicyByResolution(ctx, logger, insBkt, sy.Metas(), retentionByResolution, stubCounter); err != nil {
 			return errors.Wrap(err, "retention failed")
 		}
+		return nil
+	})
+}
+
+func registerBucketUploadBlocks(app extkingpin.AppClause, objStoreConfig *extflag.PathOrContent) {
+	cmd := app.Command("upload-blocks", "Upload blocks push blocks from the provided path to the object storage.")
+
+	tbc := &bucketUploadBlocksConfig{}
+	tbc.registerBucketUploadBlocksFlag(cmd)
+
+	cmd.Setup(func(g *run.Group, logger log.Logger, reg *prometheus.Registry, _ opentracing.Tracer, _ <-chan struct{}, _ bool) error {
+		if len(tbc.labels) == 0 {
+			return errors.New("no external labels configured, uniquely identifying external labels must be configured; see https://thanos.io/tip/thanos/storage.md#external-labels for details.")
+		}
+
+		lset, err := parseFlagLabels(tbc.labels)
+		if err != nil {
+			return errors.Wrap(err, "unable to parse external labels")
+		}
+		if err := promclient.IsDirAccessible(tbc.path); err != nil {
+			return errors.Wrapf(err, "unable to access path '%s'", tbc.path)
+		}
+
+		confContentYaml, err := objStoreConfig.Content()
+		if err != nil {
+			return errors.Wrap(err, "unable to parse objstore config")
+		}
+
+		bkt, err := client.NewBucket(logger, confContentYaml, component.Upload.String(), nil)
+		if err != nil {
+			return errors.Wrap(err, "unable to create bucket")
+		}
+		defer runutil.CloseWithLogOnErr(logger, bkt, "bucket client")
+
+		bkt = objstoretracing.WrapWithTraces(objstore.WrapWithMetrics(bkt, extprom.WrapRegistererWithPrefix("thanos_", reg), bkt.Name()))
+
+		s := shipper.New(logger, reg, tbc.path, bkt, func() labels.Labels { return lset }, metadata.BucketUploadSource,
+			nil, false, metadata.HashFunc(""), shipper.DefaultMetaFilename)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		g.Add(func() error {
+			n, err := s.Sync(ctx)
+			if err != nil {
+				return errors.Wrap(err, "unable to sync blocks")
+			}
+			level.Info(logger).Log("msg", "synced blocks", "uploaded", n)
+			return nil
+		}, func(error) {
+			cancel()
+		})
+
 		return nil
 	})
 }

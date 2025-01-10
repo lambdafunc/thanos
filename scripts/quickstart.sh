@@ -36,17 +36,16 @@ if [ -n "${MINIO_ENABLED}" ]; then
     exit 1
   fi
 
-  export MINIO_ACCESS_KEY="THANOS"
-  export MINIO_SECRET_KEY="ITSTHANOSTIME"
+  export MINIO_ROOT_USER="THANOS"
+  export MINIO_ROOT_PASSWORD="ITSTHANOSTIME"
   export MINIO_ENDPOINT="127.0.0.1:9000"
   export MINIO_BUCKET="thanos"
-  export S3_ACCESS_KEY=${MINIO_ACCESS_KEY}
-  export S3_SECRET_KEY=${MINIO_SECRET_KEY}
+  export S3_ACCESS_KEY=${MINIO_ROOT_USER}
+  export S3_SECRET_KEY=${MINIO_ROOT_PASSWORD}
   export S3_BUCKET=${MINIO_BUCKET}
   export S3_ENDPOINT=${MINIO_ENDPOINT}
   export S3_INSECURE="true"
   export S3_V2_SIGNATURE="true"
-  rm -rf data/minio
   mkdir -p data/minio
 
   ${MINIO_EXECUTABLE} server ./data/minio \
@@ -72,10 +71,20 @@ fi
 # Setup alert / rules config file.
 cat >data/rules.yml <<-EOF
 	groups:
-	  - name: example
-	    rules:
-	    - record: job:go_threads:sum
-	      expr: sum(go_threads) by (job)
+    - name: example
+      rules:
+        - record: job:go_threads:sum
+          expr: sum(go_threads) by (job)
+          labels:
+            test: label
+
+    - name: alert
+      rules:
+        - alert: HighGoThreads
+          expr: sum(go_threads) by (job) > 100
+          for: 1m
+          labels:
+            severity: page
 EOF
 
 STORES=""
@@ -148,6 +157,11 @@ fi
 
 # Start one sidecar for each Prometheus server.
 for i in $(seq 0 2); do
+  if [ -z ${CODESPACE_NAME+x} ]; then
+    PROMETHEUS_URL="http://localhost:909${i}"
+  else
+    PROMETHEUS_URL="https://${CODESPACE_NAME}-909${i}.${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN}"
+  fi
   ${THANOS_EXECUTABLE} sidecar \
     --debug.name sidecar-"${i}" \
     --log.level debug \
@@ -155,7 +169,7 @@ for i in $(seq 0 2); do
     --grpc-grace-period 1s \
     --http-address 0.0.0.0:109"${i}"2 \
     --http-grace-period 1s \
-    --prometheus.url http://localhost:909"${i}" \
+    --prometheus.url "${PROMETHEUS_URL}" \
     --tsdb.path data/prom"${i}" \
     ${OBJSTORECFG} &
 
@@ -167,6 +181,19 @@ done
 sleep 0.5
 
 if [ -n "${GCS_BUCKET}" -o -n "${S3_ENDPOINT}" ]; then
+  cat >groupcache.yml <<-EOF
+		type: GROUPCACHE
+config:
+  self_url: http://localhost:10906
+  peers:
+    - http://localhost:10906
+  groupcache_group: groupcache_test_group
+blocks_iter_ttl: 0s
+metafile_exists_ttl: 0s
+metafile_doesnt_exist_ttl: 0s
+metafile_content_ttl: 0s
+	EOF
+
   ${THANOS_EXECUTABLE} store \
     --debug.name store \
     --log.level debug \
@@ -175,6 +202,7 @@ if [ -n "${GCS_BUCKET}" -o -n "${S3_ENDPOINT}" ]; then
     --http-address 0.0.0.0:10906 \
     --http-grace-period 1s \
     --data-dir data/store \
+    --store.caching-bucket.config-file=groupcache.yml \
     ${OBJSTORECFG} &
 
   STORES="${STORES} --store 127.0.0.1:10905"
@@ -247,14 +275,13 @@ QUERIER_JAEGER_CONFIG=$(
 
 REMOTE_WRITE_FLAGS=""
 if [ -n "${STATELESS_RULER_ENABLED}" ]; then
-  cat >/data/rule-remote-write.yaml <<-EOF
-  name: "thanos-receivers"
+  cat >data/rule-remote-write.yaml <<-EOF
   remote_write:
-    url: "http://127.0.0.1:10908/api/v1/receive"
+  - url: "http://localhost:10908/api/v1/receive"
     name: "receive-0"
 EOF
 
-  REMOTE_WRITE_FLAGS="--remote-write.config-file data/rule-remote-write.yaml"
+  REMOTE_WRITE_FLAGS="--remote-write.config-file=data/rule-remote-write.yaml"
 fi
 
 # Start Thanos Ruler.

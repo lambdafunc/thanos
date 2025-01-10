@@ -4,7 +4,7 @@ Thanos uses object storage as primary storage for metrics and metadata related t
 
 ## Configuring Access to Object Storage
 
-Thanos supports any object stores that can be implemented against Thanos [objstore.Bucket interface](../pkg/objstore/objstore.go).
+Thanos supports any object stores that can be implemented against Thanos [objstore.Bucket interface](https://github.com/thanos-io/objstore/blob/main/objstore.go).
 
 All clients can be configured using `--objstore.config-file` to reference to the configuration file or `--objstore.config` to put yaml config directly.
 
@@ -37,15 +37,16 @@ In Kubernetes it is as easy as (on Thanos sidecar example):
 
 Current object storage client implementations:
 
-| Provider                                                                               | Maturity           | Aimed For             | Auto-tested on CI | Maintainers             |
-|----------------------------------------------------------------------------------------|--------------------|-----------------------|-------------------|-------------------------|
-| [Google Cloud Storage](#gcs)                                                           | Stable             | Production Usage      | yes               | @bwplotka               |
-| [AWS/S3](#s3) (and all S3-compatible storages e.g disk-based [Minio](https://min.io/)) | Stable             | Production Usage      | yes               | @bwplotka               |
-| [Azure Storage Account](#azure)                                                        | Stable             | Production Usage      | no                | @vglafirov              |
-| [OpenStack Swift](#openstack-swift)                                                    | Beta (working PoC) | Production Usage      | yes               | @FUSAKLA                |
-| [Tencent COS](#tencent-cos)                                                            | Beta               | Production Usage      | no                | @jojohappy,@hanjm       |
-| [AliYun OSS](#aliyun-oss)                                                              | Beta               | Production Usage      | no                | @shaulboozhiao,@wujinhu |
-| [Local Filesystem](#filesystem)                                                        | Stable             | Testing and Demo only | yes               | @bwplotka               |
+| Provider                                                                                  | Maturity           | Aimed For             | Auto-tested on CI | Maintainers                      |
+|-------------------------------------------------------------------------------------------|--------------------|-----------------------|-------------------|----------------------------------|
+| [Google Cloud Storage](#gcs)                                                              | Stable             | Production Usage      | yes               | @bwplotka                        |
+| [AWS/S3](#s3) (and all S3-compatible storages e.g disk-based [Minio](https://min.io/))    | Stable             | Production Usage      | yes               | @bwplotka                        |
+| [Azure Storage Account](#azure)                                                           | Stable             | Production Usage      | no                | @vglafirov                       |
+| [OpenStack Swift](#openstack-swift)                                                       | Beta (working PoC) | Production Usage      | yes               | @FUSAKLA                         |
+| [Tencent COS](#tencent-cos)                                                               | Beta               | Production Usage      | no                | @jojohappy,@hanjm                |
+| [AliYun OSS](#aliyun-oss)                                                                 | Beta               | Production Usage      | no                | @shaulboozhiao,@wujinhu          |
+| [Local Filesystem](#filesystem)                                                           | Stable             | Testing and Demo only | yes               | @bwplotka                        |
+| [Oracle Cloud Infrastructure Object Storage](#oracle-cloud-infrastructure-object-storage) | Beta               | Production Usage      | yes               | @aarontams,@gaurav-05,@ericrrath |
 
 **Missing support to some object storage?** Check out [how to add your client section](#how-to-add-a-new-client-to-thanos)
 
@@ -65,10 +66,13 @@ config:
   bucket: ""
   endpoint: ""
   region: ""
+  disable_dualstack: false
+  aws_sdk_auth: false
   access_key: ""
   insecure: false
   signature_version2: false
   secret_key: ""
+  session_token: ""
   put_user_metadata: {}
   http_config:
     idle_conn_timeout: 1m30s
@@ -79,9 +83,19 @@ config:
     max_idle_conns: 100
     max_idle_conns_per_host: 100
     max_conns_per_host: 0
+    tls_config:
+      ca_file: ""
+      cert_file: ""
+      key_file: ""
+      server_name: ""
+      insecure_skip_verify: false
+    disable_compression: false
   trace:
     enable: false
   list_objects_version: ""
+  bucket_lookup_type: auto
+  send_content_md5: true
+  disable_multipart: false
   part_size: 67108864
   sse_config:
     type: ""
@@ -89,9 +103,15 @@ config:
     kms_encryption_context: {}
     encryption_key: ""
   sts_endpoint: ""
+  max_retries: 0
+prefix: ""
 ```
 
 At a minimum, you will need to provide a value for the `bucket`, `endpoint`, `access_key`, and `secret_key` keys. The rest of the keys are optional.
+
+However if you set `aws_sdk_auth: true` Thanos will use the default authentication methods of the AWS SDK for go based on [known environment variables](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-envvars.html) (`AWS_PROFILE`, `AWS_WEB_IDENTITY_TOKEN_FILE` ... etc) and known AWS config files (~/.aws/config). If you turn this on, then the `bucket` and `endpoint` are the required config keys.
+
+The field `prefix` can be used to transparently use prefixes in your S3 bucket. This allows you to separate blocks coming from different sources into paths with different prefixes, making it easier to understand what's going on (i.e. you don't have to use Thanos tooling to know from where which blocks came).
 
 The AWS region to endpoint mapping can be found in this [link](https://docs.aws.amazon.com/general/latest/gr/s3.html).
 
@@ -105,6 +125,10 @@ Please refer to the documentation of [the Transport type](https://golang.org/pkg
 
 Set `list_objects_version: "v1"` for S3 compatible APIs that don't support ListObjectsV2 (e.g. some versions of Ceph). Default value (`""`) is equivalent to `"v2"`.
 
+`http_config.tls_config` allows configuring TLS connections. Please refer to the document of [tls_config](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#tls_config) for detailed information on what each option does.
+
+`bucket_lookup_type` can be `auto`, `virtual-hosted` or `path`. Read more about it [here](https://docs.aws.amazon.com/AmazonS3/latest/userguide/VirtualHosting.html).
+
 For debug and testing purposes you can set
 
 * `insecure: true` to switch to plain insecure HTTP instead of HTTPS
@@ -115,7 +139,7 @@ For debug and testing purposes you can set
 
 ##### S3 Server-Side Encryption
 
-SSE can be configued using the `sse_config`. [SSE-S3](https://docs.aws.amazon.com/AmazonS3/latest/dev/UsingServerSideEncryption.html), [SSE-KMS](https://docs.aws.amazon.com/AmazonS3/latest/dev/UsingKMSEncryption.html), and [SSE-C](https://docs.aws.amazon.com/AmazonS3/latest/dev/ServerSideEncryptionCustomerKeys.html) are supported.
+SSE can be configured using the `sse_config`. [SSE-S3](https://docs.aws.amazon.com/AmazonS3/latest/dev/UsingServerSideEncryption.html), [SSE-KMS](https://docs.aws.amazon.com/AmazonS3/latest/dev/UsingKMSEncryption.html), and [SSE-C](https://docs.aws.amazon.com/AmazonS3/latest/dev/ServerSideEncryptionCustomerKeys.html) are supported.
 
 * If type is set to `SSE-S3` you do not need to configure other options.
 
@@ -189,7 +213,7 @@ Example working AWS IAM policy for user:
 To test the policy, set env vars for S3 access for *empty, not used* bucket as well as:
 
 ```
-THANOS_TEST_OBJSTORE_SKIP=GCS,AZURE,SWIFT,COS,ALIYUNOSS
+THANOS_TEST_OBJSTORE_SKIP=GCS,AZURE,SWIFT,COS,ALIYUNOSS,BOS,OCI,OBS
 THANOS_ALLOW_EXISTING_BUCKET_USE=true
 ```
 
@@ -223,7 +247,7 @@ We need access to CreateBucket and DeleteBucket and access to all buckets:
 }
 ```
 
-With this policy you should be able to run set `THANOS_TEST_OBJSTORE_SKIP=GCS,AZURE,SWIFT,COS,ALIYUNOSS` and unset `S3_BUCKET` and run all tests using `make test`.
+With this policy you should be able to run set `THANOS_TEST_OBJSTORE_SKIP=GCS,AZURE,SWIFT,COS,ALIYUNOSS,BOS,OCI,OBS` and unset `S3_BUCKET` and run all tests using `make test`.
 
 Details about AWS policies: https://docs.aws.amazon.com/AmazonS3/latest/dev/using-with-s3-actions.html
 
@@ -231,7 +255,26 @@ Details about AWS policies: https://docs.aws.amazon.com/AmazonS3/latest/dev/usin
 
 If you want to use IAM credential retrieved from an instance profile, Thanos needs to authenticate through AWS STS. For this purposes you can specify your own STS Endpoint.
 
-By default Thanos will use endpoint: https://sts.amazonaws.com and AWS region coresponding endpoints.
+By default Thanos will use endpoint: https://sts.amazonaws.com and AWS region corresponding endpoints.
+
+##### S3 Storage Class
+
+By default, the `STANDARD` S3 storage class will be used. To specify a storage class, add it to the `put_user_metadata` section of the config file.
+
+For example, the config file below specifies storage class of `STANDARD_IA`.
+
+```yaml
+type: S3
+prefix: thanos-test-standard-ia
+config:
+  endpoint: s3.us-east-1.amazonaws.com
+  region: us-east-1
+  bucket: MY_BUCKET
+  put_user_metadata:
+    X-Amz-Storage-Class: STANDARD_IA
+  trace:
+    enable: true
+```
 
 #### GCS
 
@@ -244,6 +287,27 @@ type: GCS
 config:
   bucket: ""
   service_account: ""
+  use_grpc: false
+  grpc_conn_pool_size: 0
+  http_config:
+    idle_conn_timeout: 0s
+    response_header_timeout: 0s
+    insecure_skip_verify: false
+    tls_handshake_timeout: 0s
+    expect_continue_timeout: 0s
+    max_idle_conns: 0
+    max_idle_conns_per_host: 0
+    max_conns_per_host: 0
+    tls_config:
+      ca_file: ""
+      cert_file: ""
+      key_file: ""
+      server_name: ""
+      insecure_skip_verify: false
+    disable_compression: false
+  chunk_size_bytes: 0
+  max_retries: 0
+prefix: ""
 ```
 
 ##### Using GOOGLE_APPLICATION_CREDENTIALS
@@ -317,18 +381,19 @@ type: AZURE
 config:
   storage_account: ""
   storage_account_key: ""
+  storage_connection_string: ""
+  storage_create_container: false
   container: ""
   endpoint: ""
-  max_retries: 0
-  msi_resource: ""
   user_assigned_id: ""
+  max_retries: 0
+  reader_config:
+    max_retry_requests: 0
   pipeline_config:
     max_tries: 0
     try_timeout: 0s
     retry_delay: 0s
     max_retry_delay: 0s
-  reader_config:
-    max_retry_requests: 0
   http_config:
     idle_conn_timeout: 0s
     response_header_timeout: 0s
@@ -338,12 +403,28 @@ config:
     max_idle_conns: 0
     max_idle_conns_per_host: 0
     max_conns_per_host: 0
+    tls_config:
+      ca_file: ""
+      cert_file: ""
+      key_file: ""
+      server_name: ""
+      insecure_skip_verify: false
     disable_compression: false
+  msi_resource: ""
+prefix: ""
 ```
 
-If `msi_resource` is used, authentication is done via system-assigned managed identity. The value for Azure should be `https://<storage-account-name>.blob.core.windows.net`.
+If `storage_account_key` is used, authentication is done via storage account key.
 
-If `user_assigned_id` is used, authentication is done via user-assigned managed identity. When using `user_assigned_id` the `msi_resource` defaults to `https://<storage_account>.<endpoint>`
+If `user_assigned_id` is used, authentication is done via user-assigned managed identity.
+
+If `user_assigned_id` or `storage_account_key` is not passed, authentication is attempted with each of these credential types, in the following order, stopping when one provides a token:
+- EnvironmentCredential
+- WorkloadIdentityCredential
+- ManagedIdentityCredential
+- AzureCLICredential
+
+For the first three authentication types, the correct environment variables must be set for authentication to be successful. More information about the required environment variables for each authentication type can be found in the [Azure Identity Client Module for Go documentation](https://pkg.go.dev/github.com/Azure/azure-sdk-for-go/sdk/azidentity).
 
 The generic `max_retries` will be used as value for the `pipeline_config`'s `max_tries` and `reader_config`'s `max_retry_requests`. For more control, `max_retries` could be ignored (0) and one could set specific retry values.
 
@@ -367,6 +448,9 @@ config:
   password: ""
   domain_id: ""
   domain_name: ""
+  application_credential_id: ""
+  application_credential_name: ""
+  application_credential_secret: ""
   project_id: ""
   project_name: ""
   project_domain_id: ""
@@ -379,6 +463,23 @@ config:
   connect_timeout: 10s
   timeout: 5m
   use_dynamic_large_objects: false
+  http_config:
+    idle_conn_timeout: 1m30s
+    response_header_timeout: 2m
+    insecure_skip_verify: false
+    tls_handshake_timeout: 10s
+    expect_continue_timeout: 1s
+    max_idle_conns: 100
+    max_idle_conns_per_host: 100
+    max_conns_per_host: 0
+    tls_config:
+      ca_file: ""
+      cert_file: ""
+      key_file: ""
+      server_name: ""
+      insecure_skip_verify: false
+    disable_compression: false
+prefix: ""
 ```
 
 #### Tencent COS
@@ -393,17 +494,32 @@ config:
   bucket: ""
   region: ""
   app_id: ""
+  endpoint: ""
   secret_key: ""
   secret_id: ""
+  max_retries: 0
   http_config:
     idle_conn_timeout: 1m30s
     response_header_timeout: 2m
+    insecure_skip_verify: false
     tls_handshake_timeout: 10s
     expect_continue_timeout: 1s
     max_idle_conns: 100
     max_idle_conns_per_host: 100
     max_conns_per_host: 0
+    tls_config:
+      ca_file: ""
+      cert_file: ""
+      key_file: ""
+      server_name: ""
+      insecure_skip_verify: false
+    disable_compression: false
+prefix: ""
 ```
+
+The `secret_key` and `secret_id` field is required. The `http_config` field is optional for optimize HTTP transport settings. There are two ways to configure the required bucket information:
+1. Provide the values of `bucket`, `region` and `app_id` keys.
+2. Provide the values of `endpoint` key with url format when you want to specify vpc internal endpoint. Please refer to the document of [endpoint](https://intl.cloud.tencent.com/document/product/436/6224) for more detail.
 
 Set the flags `--objstore.config-file` to reference to the configuration file.
 
@@ -420,6 +536,7 @@ config:
   bucket: ""
   access_key_id: ""
   access_key_secret: ""
+prefix: ""
 ```
 
 Use --objstore.config-file to reference to this configuration file.
@@ -435,6 +552,7 @@ config:
   endpoint: ""
   access_key: ""
   secret_key: ""
+prefix: ""
 ```
 
 #### Filesystem
@@ -447,21 +565,110 @@ NOTE: This storage type is experimental and might be inefficient. It is NOT advi
 type: FILESYSTEM
 config:
   directory: ""
+prefix: ""
+```
+
+#### Oracle Cloud Infrastructure Object Storage
+
+To configure Oracle Cloud Infrastructure (OCI) Object Storage as Thanos Object Store, you need to provide appropriate authentication credentials to your OCI tenancy. The OCI object storage client implementation for Thanos supports either the default keypair or instance principal authentication.
+
+##### API Signing Key
+
+The default API signing key authentication provider leverages same [configuration as the OCI CLI](https://docs.oracle.com/en-us/iaas/Content/API/Concepts/cliconcepts.htm) which is usually stored in at `$HOME/.oci/config` or via variable names starting with the string `OCI_CLI`. If the same configuration is found in multiple places the provider will prefer the first one.
+
+The following example configures the provider to look for an existing API signing key for authentication:
+
+```yaml
+type: OCI
+config:
+  provider: "default"
+  bucket: ""
+  compartment_ocid: ""
+  part_size: ""                   // Optional part size to override the OCI default of 128 MiB, value is in bytes.
+  max_request_retries: ""         // Optional maximum number of retries for a request.
+  request_retry_interval: ""      // Optional sleep duration in seconds between retry requests.
+  http_config:
+    idle_conn_timeout: 1m30s      // Optional maximum amount of time an idle (keep-alive) connection will remain idle before closing itself. Zero means no limit.
+    response_header_timeout: 2m   // Optional amount of time to wait for a server's response headers after fully writing the request.
+    tls_handshake_timeout: 10s    // Optional maximum amount of time waiting to wait for a TLS handshake. Zero means no timeout.
+    expect_continue_timeout: 1s   // Optional amount of time to wait for a server's first response headers. Zero means no timeout and causes the body to be sent immediately.
+    insecure_skip_verify: false   // Optional. If true, crypto/tls accepts any certificate presented by the server and any host name in that certificate.
+    max_idle_conns: 100           // Optional maximum number of idle (keep-alive) connections across all hosts. Zero means no limit.
+    max_idle_conns_per_host: 100  // Optional maximum idle (keep-alive) connections to keep per-host. If zero, DefaultMaxIdleConnsPerHost=2 is used.
+    max_conns_per_host: 0         // Optional maximum total number of connections per host.
+    disable_compression: false    // Optional. If true, prevents the Transport from requesting compression.
+    client_timeout: 90s           // Optional time limit for requests made by the HTTP Client.
+```
+
+##### Instance Principal Provider
+
+For Example:
+
+```yaml
+type: OCI
+config:
+  provider: "instance-principal"
+  bucket: ""
+  compartment_ocid: ""
+```
+
+You can also include any of the optional configuration just like the example in `Default Provider`.
+
+##### Raw Provider
+
+For Example:
+
+```yaml
+type: OCI
+config:
+  provider: "raw"
+  bucket: ""
+  compartment_ocid: ""
+  tenancy_ocid: ""
+  user_ocid: ""
+  region: ""
+  fingerprint: ""
+  privatekey: ""
+  passphrase: ""         // Optional passphrase to encrypt the private API Signing key
+```
+
+You can also include any of the optional configuration just like the example in `Default Provider`.
+
+##### OCI Policies
+
+Regardless of the method you use for authentication (raw, instance-principal), you need the following 2 policies in order for Thanos (sidecar or receive) to be able to write TSDB to OCI object storage. The difference lies in whom you are giving the permissions.
+
+For using instance-principal and dynamic group:
+
+```
+Allow dynamic-group thanos to read buckets in compartment id ocid1.compartment.oc1..a
+Allow dynamic-group thanos to manage objects in compartment id ocid1.compartment.oc1..a
+```
+
+For using raw provider and an IAM group:
+
+```
+Allow group thanos to read buckets in compartment id ocid1.compartment.oc1..a
+Allow group thanos to manage objects in compartment id ocid1.compartment.oc1..a
 ```
 
 ### How to add a new client to Thanos?
 
+objstore.go
+
 Following checklist allows adding new Go code client to supported providers:
 
 1. Create new directory under `pkg/objstore/<provider>`
-2. Implement [objstore.Bucket interface](../pkg/objstore/objstore.go)
+2. Implement [objstore.Bucket interface](https://github.com/thanos-io/objstore/blob/main//objstore.go)
 3. Add `NewTestBucket` constructor for testing purposes, that creates and deletes temporary bucket.
-4. Use created `NewTestBucket` in [ForeachStore method](../pkg/objstore/objtesting/foreach.go) to ensure we can run tests against new provider. (In PR)
-5. RUN the [TestObjStoreAcceptanceTest](../pkg/objstore/objtesting/acceptance_e2e_test.go) against your provider to ensure it fits. Fix any found error until test passes. (In PR)
-6. Add client implementation to the factory in [factory](../pkg/objstore/client/factory.go) code. (Using as small amount of flags as possible in every command)
+4. Use created `NewTestBucket` in [ForeachStore method](https://github.com/thanos-io/objstore/blob/main/objtesting/foreach.go) to ensure we can run tests against new provider. (In PR)
+5. RUN the [TestObjStoreAcceptanceTest](https://github.com/thanos-io/objstore/blob/main//objtesting/acceptance_e2e_test.go) against your provider to ensure it fits. Fix any found error until test passes. (In PR)
+6. Add client implementation to the factory in [factory](https://github.com/thanos-io/objstore/blob/main/client/factory.go) code. (Using as small amount of flags as possible in every command)
 7. Add client struct config to [bucketcfggen](../scripts/cfggen/main.go) to allow config auto generation.
 
 At that point, anyone can use your provider by spec.
+
+Check the checklist in [thanos-io/objstore](https://github.com/thanos-io/objstore#how-to-add-a-new-client-to-thanos) for more comprehensive information!
 
 ## Data in Object Storage
 
@@ -489,7 +696,7 @@ total 2209344
 drwxr-xr-x 2 bwplotka bwplotka       4096 Dec 10  2019 chunks
 -rw-r--r-- 1 bwplotka bwplotka 1962383742 Dec 10  2019 index
 -rw-r--r-- 1 bwplotka bwplotka       6761 Dec 10  2019 meta.json
--rw-r--r-- 1 bwplotka bwplotka        111 Dec 10  2019 delete-mark.json      # <-- Optional marker.
+-rw-r--r-- 1 bwplotka bwplotka        111 Dec 10  2019 deletion-mark.json    # <-- Optional marker.
 -rw-r--r-- 1 bwplotka bwplotka        124 Dec 10  2019 no-compact-mark.json  # <-- Optional marker.
 
 01DN3SK96XDAEKRB1AN30AAW6E/chunks:
@@ -782,7 +989,7 @@ Every series entry first holds its number of labels, followed by tuples of symbo
 
 ##### Label Index
 
-A label index section indexes the existing (combined) values for one or more label names. The `#names` field determines the number of indexed label names, followed by the total number of entries in the `#entries` field. The body holds #entries / #names tuples of symbol table references, each tuple being of #names length. The value tuples are sorted in lexicographically increasing order. This is no longer used.
+A label index section indexes the existing (combined) values for one or more label names. The `#names` field determines the number of indexed label names, followed by the total number of entries in the `#entries` field. The body holds #entries / #names tuples of symbol table references, each tuple being of `#names` length. The value tuples are sorted in lexicographically increasing order. This is no longer used.
 
 ```
 ┌───────────────┬────────────────┬────────────────┐

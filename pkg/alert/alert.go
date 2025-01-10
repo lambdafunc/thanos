@@ -25,6 +25,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/relabel"
+	"github.com/prometheus/prometheus/notifier"
 	"go.uber.org/atomic"
 
 	"github.com/thanos-io/thanos/pkg/runutil"
@@ -36,53 +37,6 @@ const (
 	contentTypeJSON         = "application/json"
 )
 
-// Alert is a generic representation of an alert in the Prometheus eco-system.
-type Alert struct {
-	// Label value pairs for purpose of aggregation, matching, and disposition
-	// dispatching. This must minimally include an "alertname" label.
-	Labels labels.Labels `json:"labels"`
-
-	// Extra key/value information which does not define alert identity.
-	Annotations labels.Labels `json:"annotations"`
-
-	// The known time range for this alert. Start and end time are both optional.
-	StartsAt     time.Time `json:"startsAt,omitempty"`
-	EndsAt       time.Time `json:"endsAt,omitempty"`
-	GeneratorURL string    `json:"generatorURL,omitempty"`
-}
-
-// Name returns the name of the alert. It is equivalent to the "alertname" label.
-func (a *Alert) Name() string {
-	return a.Labels.Get(labels.AlertName)
-}
-
-// Hash returns a hash over the alert. It is equivalent to the alert labels hash.
-func (a *Alert) Hash() uint64 {
-	return a.Labels.Hash()
-}
-
-func (a *Alert) String() string {
-	s := fmt.Sprintf("%s[%s]", a.Name(), fmt.Sprintf("%016x", a.Hash())[:7])
-	if a.Resolved() {
-		return s + "[resolved]"
-	}
-	return s + "[active]"
-}
-
-// Resolved returns true iff the activity interval ended in the past.
-func (a *Alert) Resolved() bool {
-	return a.ResolvedAt(time.Now())
-}
-
-// ResolvedAt returns true off the activity interval ended before
-// the given timestamp.
-func (a *Alert) ResolvedAt(ts time.Time) bool {
-	if a.EndsAt.IsZero() {
-		return false
-	}
-	return !a.EndsAt.After(ts)
-}
-
 // Queue is a queue of alert notifications waiting to be sent. The queue is consumed in batches
 // and entries are dropped at the front if it runs full.
 type Queue struct {
@@ -90,11 +44,11 @@ type Queue struct {
 	maxBatchSize        int
 	capacity            int
 	toAddLset           labels.Labels
-	toExcludeLabels     labels.Labels
+	toExcludeLabels     []string
 	alertRelabelConfigs []*relabel.Config
 
 	mtx   sync.Mutex
-	queue []*Alert
+	queue []*notifier.Alert
 	morec chan struct{}
 
 	pushed  prometheus.Counter
@@ -102,29 +56,9 @@ type Queue struct {
 	dropped prometheus.Counter
 }
 
-func relabelLabels(lset labels.Labels, excludeLset []string) (toAdd, toExclude labels.Labels) {
-	for _, ln := range excludeLset {
-		toExclude = append(toExclude, labels.Label{Name: ln})
-	}
-
-	for _, l := range lset {
-		// Exclude labels to  to add straight away.
-		if toExclude.Has(l.Name) {
-			continue
-		}
-		toAdd = append(toAdd, labels.Label{
-			Name:  l.Name,
-			Value: l.Value,
-		})
-	}
-	return toAdd, toExclude
-}
-
 // NewQueue returns a new queue. The given label set is attached to all alerts pushed to the queue.
 // The given exclude label set tells what label names to drop including external labels.
 func NewQueue(logger log.Logger, reg prometheus.Registerer, capacity, maxBatchSize int, externalLset labels.Labels, excludeLabels []string, alertRelabelConfigs []*relabel.Config) *Queue {
-	toAdd, toExclude := relabelLabels(externalLset, excludeLabels)
-
 	if logger == nil {
 		logger = log.NewNopLogger()
 	}
@@ -133,8 +67,8 @@ func NewQueue(logger log.Logger, reg prometheus.Registerer, capacity, maxBatchSi
 		capacity:            capacity,
 		morec:               make(chan struct{}, 1),
 		maxBatchSize:        maxBatchSize,
-		toAddLset:           toAdd,
-		toExcludeLabels:     toExclude,
+		toAddLset:           labels.NewBuilder(externalLset.Copy()).Del(excludeLabels...).Labels(),
+		toExcludeLabels:     excludeLabels,
 		alertRelabelConfigs: alertRelabelConfigs,
 
 		dropped: promauto.With(reg).NewCounter(prometheus.CounterOpts{
@@ -180,7 +114,7 @@ func (q *Queue) Cap() int {
 // Pop takes a batch of alerts from the front of the queue. The batch size is limited
 // according to the queues maxBatchSize limit.
 // It blocks until elements are available or a termination signal is send on termc.
-func (q *Queue) Pop(termc <-chan struct{}) []*Alert {
+func (q *Queue) Pop(termc <-chan struct{}) []*notifier.Alert {
 	select {
 	case <-termc:
 		return nil
@@ -190,7 +124,7 @@ func (q *Queue) Pop(termc <-chan struct{}) []*Alert {
 	q.mtx.Lock()
 	defer q.mtx.Unlock()
 
-	as := make([]*Alert, q.maxBatchSize)
+	as := make([]*notifier.Alert, q.maxBatchSize)
 	n := copy(as, q.queue)
 	q.queue = q.queue[n:]
 
@@ -206,7 +140,7 @@ func (q *Queue) Pop(termc <-chan struct{}) []*Alert {
 }
 
 // Push adds a list of alerts to the queue.
-func (q *Queue) Push(alerts []*Alert) {
+func (q *Queue) Push(alerts []*notifier.Alert) {
 	if len(alerts) == 0 {
 		return
 	}
@@ -216,21 +150,25 @@ func (q *Queue) Push(alerts []*Alert) {
 
 	q.pushed.Add(float64(len(alerts)))
 
-	// Attach external labels and drop excluded labels before sending.
+	// Attach external labels, drop excluded labels and process relabeling before sending.
+	var relabeledAlerts []*notifier.Alert
+	b := labels.NewBuilder(labels.EmptyLabels())
 	for _, a := range alerts {
-		lb := labels.NewBuilder(labels.Labels{})
-		for _, l := range a.Labels {
-			if q.toExcludeLabels.Has(l.Name) {
-				continue
-			}
-			lb.Set(l.Name, l.Value)
+		b.Reset(a.Labels.Copy())
+		b.Del(q.toExcludeLabels...)
+		q.toAddLset.Range(func(l labels.Label) {
+			b.Set(l.Name, l.Value)
+		})
+		if lset, keep := relabel.Process(b.Labels(), q.alertRelabelConfigs...); keep {
+			a.Labels = lset
+			relabeledAlerts = append(relabeledAlerts, a)
 		}
-		for _, l := range q.toAddLset {
-			lb.Set(l.Name, l.Value)
-		}
-		a.Labels = relabel.Process(lb.Labels(), q.alertRelabelConfigs...)
 	}
 
+	alerts = relabeledAlerts
+	if len(alerts) == 0 {
+		return
+	}
 	// Queue capacity should be significantly larger than a single alert
 	// batch could be.
 	if d := len(alerts) - q.capacity; d > 0 {
@@ -321,18 +259,17 @@ func NewSender(
 	return s
 }
 
-func toAPILabels(labels labels.Labels) models.LabelSet {
-	apiLabels := make(models.LabelSet, len(labels))
-	for _, label := range labels {
-		apiLabels[label.Name] = label.Value
-	}
-
+func toAPILabels(lbls labels.Labels) models.LabelSet {
+	apiLabels := make(models.LabelSet, lbls.Len())
+	lbls.Range(func(l labels.Label) {
+		apiLabels[l.Name] = l.Value
+	})
 	return apiLabels
 }
 
 // Send an alert batch to all given Alertmanager clients.
 // TODO(bwplotka): https://github.com/thanos-io/thanos/issues/660.
-func (s *Sender) Send(ctx context.Context, alerts []*Alert) {
+func (s *Sender) Send(ctx context.Context, alerts []*notifier.Alert) {
 	if len(alerts) == 0 {
 		return
 	}

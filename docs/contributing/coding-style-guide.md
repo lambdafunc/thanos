@@ -273,7 +273,7 @@ func copyIntoSliceAndMap(biggy []string) (a []string, b map[string]struct{})
 
 To extend the above point, there are cases where you don't need to allocate new space in memory all the time. If you repeat the certain operation on slices sequentially and you just release the array on every iteration, it's reasonable to reuse the underlying array for those. This can give quite enormous gains for critical paths. Unfortunately, currently there is no way to reuse the underlying array for maps.
 
-NOTE: Why you cannot just allocate slice and release and in new iteration allocate and release again etc? Go should know it has available space and just reuses that no? (: Well, it's not that easy. TL;DR is that Go Garbage Collection runs periodically or on certain cases (big heap), but definitely not on every iteration of your loop (that would be super slow). Read more in details [here](https://about.sourcegraph.com/go/gophercon-2018-allocator-wrestling).
+NOTE: Why you cannot just allocate slice and release and in new iteration allocate and release again etc? Go should know it has available space and just reuses that no? (: Well, it's not that easy. TL;DR is that Go Garbage Collection runs periodically or on certain cases (big heap), but definitely not on every iteration of your loop (that would be super slow). Read more in details [here](http://web.archive.org/web/20220511045405/https://about.sourcegraph.com/go/gophercon-2018-allocator-wrestling/).
 
 <table>
 <tbody>
@@ -283,16 +283,16 @@ NOTE: Why you cannot just allocate slice and release and in new iteration alloca
 ```go
 var messages []string
 for _, msg := range recv {
-    messages = append(messages, msg)
+	messages = append(messages, msg)
 
-    if len(messages) > maxMessageLen {
-        marshalAndSend(messages)
-        // This creates new array. Previous array
-        // will be garbage collected only after
-        // some time (seconds), which
-        // can create enormous memory pressure.
-        messages = []string
-    }
+	if len(messages) > maxMessageLen {
+		marshalAndSend(messages)
+		// This creates new array. Previous array
+		// will be garbage collected only after
+		// some time (seconds), which
+		// can create enormous memory pressure.
+		messages = []string
+	}
 }
 ```
 
@@ -523,26 +523,26 @@ func OpenSomeFileAndDoSomeStuff() (*os.File, error) {
 
 ```go
 func OpenSomeFileAndDoSomeStuff() (f *os.File, err error) {
-    f, err = os.OpenFile("file.txt", os.O_RDONLY, 0)
-    if err != nil {
-        return nil, err
-    }
-    defer func() {
-        if err != nil {
-             runutil.CloseWithErrCapture(&err, f, "close file")
-        }
-    }
+	f, err = os.OpenFile("file.txt", os.O_RDONLY, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			runutil.CloseWithErrCapture(&err, f, "close file")
+		}
+	}()
 
-    if err := doStuff1(); err != nil {
-        return nil, err
-    }
-    if err := doStuff2(); err != nil {
-        return nil, err
-    }
-    if err := doStuff232241(); err != nil {
-        return nil, err
-    }
-    return f, nil
+	if err := doStuff1(); err != nil {
+		return nil, err
+	}
+	if err := doStuff2(); err != nil {
+		return nil, err
+	}
+	if err := doStuff232241(); err != nil {
+		return nil, err
+	}
+	return f, nil
 }
 ```
 

@@ -22,7 +22,7 @@ To work with the React UI code, you will need to have the following tools instal
 
 The React UI depends on a large number of [npm](https://www.npmjs.com/) packages. These are not checked in, so you will need to download and install them locally via the npm package manager:
 
-    npm install 
+    npm install
 
 npm consults the `package.json` and `package-lock.json` files for dependencies to install. It creates a `node_modules` directory with all installed dependencies.
 
@@ -80,4 +80,4 @@ To build a Thanos binary that includes a compiled-in version of the production b
 
 This compiles in all web assets into the Thanos binary.
 
-Note that `make build` only compiles static assets using `bindata.go`, if you are working on React UI, make sure you run `make assets` to update `pkg/ui/bindata.go`
+Note that `make build` only compiles static assets in `pkg/ui/static/`, if you are working on React UI, make sure you run `make react-app` to update `pkg/ui/static/`.

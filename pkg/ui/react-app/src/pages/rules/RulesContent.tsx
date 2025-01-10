@@ -22,12 +22,12 @@ export interface RulesMap {
   groups: RuleGroup[];
 }
 
-const GraphExpressionLink: FC<{ expr: string; title: string }> = (props) => {
+const GraphExpressionLink: FC<{ expr: string; text: string; title: string }> = (props) => {
   return (
     <>
       <strong>{props.title}:</strong>
       <a className="ml-4" href={createExternalExpressionLink(props.expr)}>
-        {props.expr}
+        {props.text}
       </a>
       <br />
     </>
@@ -84,14 +84,18 @@ export const RulesContent: FC<RouteComponentProps & RulesContentProps> = ({ resp
                     <tr key={i}>
                       {r.alerts ? (
                         <td className="rule-cell">
-                          <GraphExpressionLink title="alert" expr={r.name} />
-                          <GraphExpressionLink title="expr" expr={r.query} />
+                          <GraphExpressionLink title="alert" text={r.name} expr={`ALERTS{alertname="${r.name}"}`} />
+                          <GraphExpressionLink title="expr" text={r.query} expr={r.query} />
                           {r.duration > 0 && (
                             <div>
                               <strong>for:</strong> {formatDuration(r.duration * 1000)}
                             </div>
                           )}
-
+                          {r.keepFiringFor > 0 && (
+                            <div>
+                              <strong>keep_firing_for:</strong> {formatDuration(r.keepFiringFor * 1000)}
+                            </div>
+                          )}
                           <div>
                             <strong>labels:</strong>
                             {Object.entries(r.labels).map(([key, value]) => (
@@ -110,9 +114,15 @@ export const RulesContent: FC<RouteComponentProps & RulesContentProps> = ({ resp
                           </div>
                         </td>
                       ) : (
-                        <td style={{ backgroundColor: '#F5F5F5' }}>
-                          <GraphExpressionLink title="record" expr={r.name} />
-                          <GraphExpressionLink title="expr" expr={r.query} />
+                        <td>
+                          <GraphExpressionLink title="record" text={r.name} expr={r.name} />
+                          <GraphExpressionLink title="expr" text={r.query} expr={r.query} />
+                          <strong>labels:</strong>
+                          {Object.entries(r.labels).map(([key, value]) => (
+                            <div className="ml-4" key={key}>
+                              {key}: {value}
+                            </div>
+                          ))}
                         </td>
                       )}
                       <td>

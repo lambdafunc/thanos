@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
@@ -21,17 +20,18 @@ import (
 	"github.com/oklog/ulid"
 	"github.com/prometheus/common/route"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/thanos-io/objstore"
 
+	"github.com/efficientgo/core/testutil"
 	baseAPI "github.com/thanos-io/thanos/pkg/api"
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
-	"github.com/thanos-io/thanos/pkg/objstore"
-	"github.com/thanos-io/thanos/pkg/testutil"
+	"github.com/thanos-io/thanos/pkg/testutil/custom"
 	"github.com/thanos-io/thanos/pkg/testutil/e2eutil"
 )
 
 func TestMain(m *testing.M) {
-	testutil.TolerantVerifyLeakMain(m)
+	custom.TolerantVerifyLeakMain(m)
 }
 
 type endpointTestCase struct {
@@ -72,7 +72,8 @@ func testEndpoint(t *testing.T, test endpointTestCase, name string, responseComp
 			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		}
 
-		resp, _, apiErr := test.endpoint(req.WithContext(ctx))
+		resp, _, apiErr, releaseResources := test.endpoint(req.WithContext(ctx))
+		defer releaseResources()
 		if apiErr != nil {
 			if test.errType == baseAPI.ErrorNone {
 				t.Fatalf("Unexpected error: %s", apiErr)
@@ -94,17 +95,16 @@ func testEndpoint(t *testing.T, test endpointTestCase, name string, responseComp
 
 func TestMarkBlockEndpoint(t *testing.T) {
 	ctx := context.Background()
-	tmpDir, err := ioutil.TempDir("", "test-read-mark")
-	testutil.Ok(t, err)
+	tmpDir := t.TempDir()
 
 	// create block
 	b1, err := e2eutil.CreateBlock(ctx, tmpDir, []labels.Labels{
-		{{Name: "a", Value: "1"}},
-		{{Name: "a", Value: "2"}},
-		{{Name: "a", Value: "3"}},
-		{{Name: "a", Value: "4"}},
-		{{Name: "b", Value: "1"}},
-	}, 100, 0, 1000, labels.Labels{{Name: "ext1", Value: "val1"}}, 124, metadata.NoneFunc)
+		labels.FromStrings("a", "1"),
+		labels.FromStrings("a", "2"),
+		labels.FromStrings("a", "3"),
+		labels.FromStrings("a", "4"),
+		labels.FromStrings("b", "1"),
+	}, 100, 0, 1000, labels.FromStrings("ext1", "val1"), 124, metadata.NoneFunc)
 	testutil.Ok(t, err)
 
 	// upload block

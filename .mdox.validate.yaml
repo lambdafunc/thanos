@@ -1,4 +1,10 @@
 version: 1
+timeout: '1m'
+host_max_conns: 10
+cache:
+  type: 'SQLite'
+  # # 60h is 2.5 days, half the default cache validity (5 days).
+  jitter: '60h'
 
 validators:
   # Validators to skip checking PR/issue links of Thanos, Prometheus and Cortex.
@@ -19,4 +25,28 @@ validators:
     type: 'ignore'
   # couldn't reach even when curl-ed.
   - regex: 'cloud\.baidu\.com'
+    type: 'ignore'
+  # 403 when curl-ed from GitHub actions, though not from a developer machine. Likely due to secondary rate limits.
+  - regex: 'docs\.github\.com'
+    type: 'ignore'
+  # 403 when requested my mdox in GH actions.
+  - regex: 'nginx\.com'
+    type: 'ignore'
+  # 403 when requested my mdox in GH actions.
+  - regex: 'servicenow\.com'
+    type: 'ignore'
+  # Seems like improbable.io temporarily removed their blogs.
+  - regex: 'improbable\.io'
+    type: 'ignore'
+  - regex: 'krisztianfekete\.org'
+    type: 'ignore'
+  - regex: 'twitter\.com'
+    type: 'ignore'
+  - regex: 'outshift\.cisco\.com\/blog\/multi-cluster-monitoring'
+    type: 'ignore'
+  # Expired certificate
+  - regex: 'bestpractices\.coreinfrastructure\.org\/projects\/3048'
+    type: 'ignore'
+  # Frequent DNS issues. 
+  - regex: 'build\.thebeat\.co'
     type: 'ignore'

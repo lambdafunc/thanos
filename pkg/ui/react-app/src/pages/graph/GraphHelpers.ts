@@ -1,9 +1,9 @@
 import $ from 'jquery';
 
 import { escapeHTML } from '../../utils';
-import { Metric } from '../../types/types';
 import { GraphProps, GraphSeries } from './Graph';
 import moment from 'moment-timezone';
+import { colorPool } from './ColorPool';
 
 export const formatValue = (y: number | null): string => {
   if (y === null) {
@@ -133,51 +133,30 @@ export const getOptions = (stacked: boolean, useLocalTime: boolean): jquery.flot
       },
       shadowSize: 0,
     },
+    selection: {
+      mode: 'x',
+    },
   };
 };
 
-// This was adapted from Flot's color generation code.
-export const getColors = (data: {
-  resultType: string;
-  result: Array<{ metric: Metric; values: [number, string][] }>;
-}): Color[] => {
-  const colorPool = ['#edc240', '#afd8f8', '#cb4b4b', '#4da74d', '#9440ed'];
-  const colorPoolSize = colorPool.length;
-  let variation = 0;
-  return data.result.map((_, i) => {
-    // Each time we exhaust the colors in the pool we adjust
-    // a scaling factor used to produce more variations on
-    // those colors. The factor alternates negative/positive
-    // to produce lighter/darker colors.
-
-    // Reset the variation after every few cycles, or else
-    // it will end up producing only white or black colors.
-
-    if (i % colorPoolSize === 0 && i) {
-      if (variation >= 0) {
-        variation = variation < 0.5 ? -variation - 0.2 : 0;
-      } else {
-        variation = -variation;
-      }
-    }
-    return $.color.parse(colorPool[i % colorPoolSize] || '#666').scale('rgb', 1 + variation);
-  });
-};
-
 export const normalizeData = ({ queryParams, data }: GraphProps): GraphSeries[] => {
-  const colors = getColors(data);
   const { startTime, endTime, resolution } = queryParams!;
-  return data.result.map(({ values, metric }, index) => {
+  return data.result.map(({ values, histograms, metric }, index) => {
     // Insert nulls for all missing steps.
     const data = [];
-    let pos = 0;
+    let valPos = 0;
+    let histogramPos = 0;
 
     for (let t = startTime; t <= endTime; t += resolution) {
       // Allow for floating point inaccuracy.
-      const currentValue = values[pos];
-      if (values.length > pos && currentValue[0] < t + resolution / 100) {
+      const currentValue = values && values[valPos];
+      const currentHistogram = histograms && histograms[histogramPos];
+      if (currentValue && values.length > valPos && currentValue[0] < t + resolution / 100) {
         data.push([currentValue[0] * 1000, parseValue(currentValue[1])]);
-        pos++;
+        valPos++;
+      } else if (currentHistogram && histograms.length > histogramPos && currentHistogram[0] < t + resolution / 100) {
+        data.push([currentHistogram[0] * 1000, parseValue(currentHistogram[1].sum)]);
+        histogramPos++;
       } else {
         data.push([t * 1000, null]);
       }
@@ -185,7 +164,7 @@ export const normalizeData = ({ queryParams, data }: GraphProps): GraphSeries[] 
 
     return {
       labels: metric !== null ? metric : {},
-      color: colors[index].toString(),
+      color: colorPool[index % colorPool.length],
       data,
       index,
     };

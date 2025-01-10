@@ -6,8 +6,6 @@ package replicate
 import (
 	"context"
 	"math/rand"
-	"strconv"
-	"strings"
 	"time"
 
 	extflag "github.com/efficientgo/tools/extkingpin"
@@ -15,19 +13,23 @@ import (
 	"github.com/go-kit/log/level"
 	"github.com/oklog/run"
 	"github.com/oklog/ulid"
-	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
+	amlabels "github.com/prometheus/alertmanager/pkg/labels"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
+
+	"github.com/thanos-io/objstore"
+	"github.com/thanos-io/objstore/client"
+	objstoretracing "github.com/thanos-io/objstore/tracing/opentracing"
 
 	thanosblock "github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/compact"
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/extprom"
 	thanosmodel "github.com/thanos-io/thanos/pkg/model"
-	"github.com/thanos-io/thanos/pkg/objstore/client"
 	"github.com/thanos-io/thanos/pkg/prober"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	"github.com/thanos-io/thanos/pkg/server/http"
@@ -40,29 +42,17 @@ const (
 )
 
 // ParseFlagMatchers parse flag into matchers.
-func ParseFlagMatchers(s []string) ([]*labels.Matcher, error) {
-	matchers := make([]*labels.Matcher, 0, len(s))
-
-	for _, l := range s {
-		parts := strings.SplitN(l, "=", 2)
-		if len(parts) != 2 {
-			return nil, errors.Errorf("unrecognized label %q", l)
+func ParseFlagMatchers(s string) ([]*labels.Matcher, error) {
+	amMatchers, err := amlabels.ParseMatchers(s)
+	if err != nil {
+		return nil, err
+	}
+	matchers := make([]*labels.Matcher, 0, len(amMatchers))
+	for _, a := range amMatchers {
+		if !model.LabelName.IsValid(model.LabelName(a.Name)) {
+			return nil, errors.Errorf("unsupported format for label %s", a.Name)
 		}
-
-		labelName := parts[0]
-		if !model.LabelName.IsValid(model.LabelName(labelName)) {
-			return nil, errors.Errorf("unsupported format for label %s", l)
-		}
-
-		labelValue, err := strconv.Unquote(parts[1])
-		if err != nil {
-			return nil, errors.Wrap(err, "unquote label value")
-		}
-		newEqualMatcher, err := labels.NewMatcher(labels.MatchEqual, labelName, labelValue)
-		if err != nil {
-			return nil, errors.Wrap(err, "new equal matcher")
-		}
-		matchers = append(matchers, newEqualMatcher)
+		matchers = append(matchers, labels.MustNewMatcher(labels.MatchType(a.Type), a.Name, a.Value))
 	}
 
 	return matchers, nil
@@ -85,6 +75,7 @@ func RunReplicate(
 	singleRun bool,
 	minTime, maxTime *thanosmodel.TimeOrDurationValue,
 	blockIDs []ulid.ULID,
+	ignoreMarkedForDeletion bool,
 ) error {
 	logger = log.With(logger, "component", "replicate")
 
@@ -124,15 +115,17 @@ func RunReplicate(
 		return errors.New("No supported bucket was configured to replicate from")
 	}
 
-	fromBkt, err := client.NewBucket(
-		logger,
-		fromConfContentYaml,
-		prometheus.WrapRegistererWith(prometheus.Labels{"replicate": "from"}, reg),
-		component.Replicate.String(),
-	)
+	bkt, err := client.NewBucket(logger, fromConfContentYaml, component.Replicate.String(), nil)
 	if err != nil {
 		return err
 	}
+	fromBkt := objstoretracing.WrapWithTraces(
+		objstore.WrapWithMetrics(
+			bkt,
+			prometheus.WrapRegistererWithPrefix("thanos_", prometheus.WrapRegistererWith(prometheus.Labels{"replicate": "from"}, reg)),
+			bkt.Name(),
+		),
+	)
 
 	toConfContentYaml, err := toObjStoreConfig.Content()
 	if err != nil {
@@ -143,15 +136,17 @@ func RunReplicate(
 		return errors.New("No supported bucket was configured to replicate to")
 	}
 
-	toBkt, err := client.NewBucket(
-		logger,
-		toConfContentYaml,
-		prometheus.WrapRegistererWith(prometheus.Labels{"replicate": "to"}, reg),
-		component.Replicate.String(),
-	)
+	toBkt, err := client.NewBucket(logger, toConfContentYaml, component.Replicate.String(), nil)
 	if err != nil {
 		return err
 	}
+	toBkt = objstoretracing.WrapWithTraces(
+		objstore.WrapWithMetrics(
+			toBkt,
+			prometheus.WrapRegistererWithPrefix("thanos_", prometheus.WrapRegistererWith(prometheus.Labels{"replicate": "to"}, reg)),
+			toBkt.Name(),
+		),
+	)
 
 	replicationRunCounter := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 		Name: "thanos_replicate_replication_runs_total",
@@ -166,16 +161,7 @@ func RunReplicate(
 	}, []string{"result"})
 	replicationRunDuration.WithLabelValues(labelSuccess)
 	replicationRunDuration.WithLabelValues(labelError)
-
-	fetcher, err := thanosblock.NewMetaFetcher(
-		logger,
-		32,
-		fromBkt,
-		"",
-		reg,
-		[]thanosblock.MetadataFilter{thanosblock.NewTimePartitionMetaFilter(*minTime, *maxTime)},
-		nil,
-	)
+	fetcher, err := newMetaFetcher(logger, fromBkt, reg, *minTime, *maxTime, 32, ignoreMarkedForDeletion)
 	if err != nil {
 		return errors.Wrapf(err, "create meta fetcher with bucket %v", fromBkt)
 	}
@@ -241,4 +227,31 @@ func RunReplicate(
 	level.Info(logger).Log("msg", "starting replication")
 
 	return nil
+}
+
+func newMetaFetcher(
+	logger log.Logger,
+	fromBkt objstore.InstrumentedBucket,
+	reg prometheus.Registerer,
+	minTime,
+	maxTime thanosmodel.TimeOrDurationValue,
+	concurrency int,
+	ignoreMarkedForDeletion bool,
+) (*thanosblock.MetaFetcher, error) {
+	filters := []thanosblock.MetadataFilter{
+		thanosblock.NewTimePartitionMetaFilter(minTime, maxTime),
+	}
+	if ignoreMarkedForDeletion {
+		filters = append(filters, thanosblock.NewIgnoreDeletionMarkFilter(logger, fromBkt, 0, concurrency))
+	}
+	baseBlockIDsFetcher := thanosblock.NewConcurrentLister(logger, fromBkt)
+	return thanosblock.NewMetaFetcher(
+		logger,
+		concurrency,
+		fromBkt,
+		baseBlockIDsFetcher,
+		"",
+		reg,
+		filters,
+	)
 }

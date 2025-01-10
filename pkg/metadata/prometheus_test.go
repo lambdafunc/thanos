@@ -11,25 +11,33 @@ import (
 	"testing"
 	"time"
 
+	"github.com/efficientgo/core/testutil"
 	"github.com/go-kit/log"
 	"github.com/pkg/errors"
-	"github.com/prometheus/prometheus/storage"
-
+	"github.com/prometheus/prometheus/util/annotations"
 	"github.com/thanos-io/thanos/pkg/metadata/metadatapb"
 	"github.com/thanos-io/thanos/pkg/promclient"
 	"github.com/thanos-io/thanos/pkg/runutil"
-	"github.com/thanos-io/thanos/pkg/testutil"
+	"github.com/thanos-io/thanos/pkg/testutil/custom"
 	"github.com/thanos-io/thanos/pkg/testutil/e2eutil"
 )
 
 func TestMain(m *testing.M) {
-	testutil.TolerantVerifyLeakMain(m)
+	custom.TolerantVerifyLeakMain(m)
 }
 
 func TestPrometheus_Metadata_e2e(t *testing.T) {
 	p, err := e2eutil.NewPrometheus()
 	testutil.Ok(t, err)
 	defer func() { testutil.Ok(t, p.Stop()) }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	upctx, upcancel := context.WithTimeout(ctx, 10*time.Second)
+	defer upcancel()
+
+	logger := log.NewNopLogger()
 
 	p.SetConfig(fmt.Sprintf(`
 global:
@@ -43,17 +51,7 @@ scrape_configs:
   static_configs:
   - targets: ['%s']
 `, e2eutil.PromAddrPlaceHolder))
-	testutil.Ok(t, p.Start())
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	upctx, upcancel := context.WithTimeout(ctx, 10*time.Second)
-	defer upcancel()
-
-	logger := log.NewNopLogger()
-	err = p.WaitPrometheusUp(upctx, logger)
-	testutil.Ok(t, err)
+	testutil.Ok(t, p.Start(upctx, logger))
 
 	u, err := url.Parse("http://" + p.Addr())
 	testutil.Ok(t, err)
@@ -114,7 +112,7 @@ scrape_configs:
 				Limit:  tcase.limit,
 			})
 
-			testutil.Equals(t, storage.Warnings(nil), w)
+			testutil.Equals(t, annotations.Annotations(nil), w)
 			testutil.Ok(t, err)
 			testutil.Assert(t, tcase.expectedFunc(meta))
 		})

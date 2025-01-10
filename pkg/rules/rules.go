@@ -7,11 +7,14 @@ import (
 	"context"
 	"sort"
 	"sync"
+	"text/template"
+	"text/template/parse"
 
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/model/labels"
-	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/util/annotations"
 
+	"github.com/thanos-io/thanos/pkg/extpromql"
 	"github.com/thanos-io/thanos/pkg/rules/rulespb"
 	"github.com/thanos-io/thanos/pkg/tracing"
 )
@@ -21,7 +24,7 @@ var _ UnaryClient = &GRPCClient{}
 // UnaryClient is gRPC rulespb.Rules client which expands streaming rules API. Useful for consumers that does not
 // support streaming.
 type UnaryClient interface {
-	Rules(ctx context.Context, req *rulespb.RulesRequest) (*rulespb.RuleGroups, storage.Warnings, error)
+	Rules(ctx context.Context, req *rulespb.RulesRequest) (*rulespb.RuleGroups, annotations.Annotations, error)
 }
 
 // GRPCClient allows to retrieve rules from local gRPC streaming server implementation.
@@ -48,7 +51,7 @@ func NewGRPCClientWithDedup(rs rulespb.RulesServer, replicaLabels []string) *GRP
 	return c
 }
 
-func (rr *GRPCClient) Rules(ctx context.Context, req *rulespb.RulesRequest) (*rulespb.RuleGroups, storage.Warnings, error) {
+func (rr *GRPCClient) Rules(ctx context.Context, req *rulespb.RulesRequest) (*rulespb.RuleGroups, annotations.Annotations, error) {
 	span, ctx := tracing.StartSpan(ctx, "rules_request")
 	defer span.Finish()
 
@@ -57,6 +60,18 @@ func (rr *GRPCClient) Rules(ctx context.Context, req *rulespb.RulesRequest) (*ru
 	if err := rr.proxy.Rules(req, resp); err != nil {
 		return nil, nil, errors.Wrap(err, "proxy Rules")
 	}
+
+	var err error
+	matcherSets := make([][]*labels.Matcher, len(req.MatcherString))
+	for i, s := range req.MatcherString {
+		matcherSets[i], err = extpromql.ParseMetricSelector(s)
+		if err != nil {
+			return nil, nil, errors.Wrap(err, "parser ParseMetricSelector")
+		}
+	}
+
+	resp.groups = filterRulesByMatchers(resp.groups, matcherSets)
+	resp.groups = filterRulesByNamesAndFile(resp.groups, req.RuleName, req.RuleGroup, req.File)
 
 	// TODO(bwplotka): Move to SortInterface with equal method and heap.
 	resp.groups = dedupGroups(resp.groups)
@@ -67,6 +82,112 @@ func (rr *GRPCClient) Rules(ctx context.Context, req *rulespb.RulesRequest) (*ru
 	return &rulespb.RuleGroups{Groups: resp.groups}, resp.warnings, nil
 }
 
+// filters rules by group name, rule name or file.
+func filterRulesByNamesAndFile(ruleGroups []*rulespb.RuleGroup, ruleName []string, ruleGroup []string, file []string) []*rulespb.RuleGroup {
+	if len(ruleName) == 0 && len(ruleGroup) == 0 && len(file) == 0 {
+		return ruleGroups
+	}
+
+	queryFormToSet := func(values []string) map[string]struct{} {
+		set := make(map[string]struct{}, len(values))
+		for _, v := range values {
+			set[v] = struct{}{}
+		}
+		return set
+	}
+
+	rnSet := queryFormToSet(ruleName)
+	rgSet := queryFormToSet(ruleGroup)
+	fSet := queryFormToSet(file)
+
+	rgs := make([]*rulespb.RuleGroup, 0, len(ruleGroups))
+	for _, grp := range ruleGroups {
+		if len(rgSet) > 0 {
+			if _, ok := rgSet[grp.Name]; !ok {
+				continue
+			}
+		}
+
+		if len(fSet) > 0 {
+			if _, ok := fSet[grp.File]; !ok {
+				continue
+			}
+		}
+
+		if len(rnSet) > 0 {
+			ruleCount := 0
+			for _, r := range grp.Rules {
+				if _, ok := rnSet[r.GetName()]; ok {
+					grp.Rules[ruleCount] = r
+					ruleCount++
+				}
+			}
+			grp.Rules = grp.Rules[:ruleCount]
+		}
+		if len(grp.Rules) > 0 {
+			rgs = append(rgs, grp)
+		}
+	}
+	return rgs
+}
+
+// filterRulesbyMatchers filters rules in a group according to given matcherSets.
+func filterRulesByMatchers(ruleGroups []*rulespb.RuleGroup, matcherSets [][]*labels.Matcher) []*rulespb.RuleGroup {
+	if len(matcherSets) == 0 {
+		return ruleGroups
+	}
+
+	groupCount := 0
+	for _, g := range ruleGroups {
+		ruleCount := 0
+		for _, r := range g.Rules {
+			// Filter rules based on matcher.
+			rl := r.GetLabels()
+			if matches(matcherSets, rl) {
+				g.Rules[ruleCount] = r
+				ruleCount++
+			}
+		}
+		g.Rules = g.Rules[:ruleCount]
+
+		// Filter groups based on number of rules.
+		if len(g.Rules) != 0 {
+			ruleGroups[groupCount] = g
+			groupCount++
+		}
+	}
+	ruleGroups = ruleGroups[:groupCount]
+
+	return ruleGroups
+}
+
+// matches returns whether the non-templated labels satisfy all the matchers in matcherSets.
+func matches(matcherSets [][]*labels.Matcher, l labels.Labels) bool {
+	if len(matcherSets) == 0 {
+		return true
+	}
+
+	b := labels.NewBuilder(labels.EmptyLabels())
+	labelTemplate := template.New("label")
+	l.Range(func(label labels.Label) {
+		t, err := labelTemplate.Parse(label.Value)
+		// Label value is non-templated if it is one node of type NodeText.
+		if err == nil && len(t.Root.Nodes) == 1 && t.Root.Nodes[0].Type() == parse.NodeText {
+			b.Set(label.Name, label.Value)
+		}
+	})
+	nonTemplatedLabels := b.Labels()
+
+	for _, matchers := range matcherSets {
+		for _, m := range matchers {
+			if v := nonTemplatedLabels.Get(m.Name); !m.Matches(v) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // dedupRules re-sorts the set so that the same series with different replica
 // labels are coming right after each other.
 func dedupRules(rules []*rulespb.Rule, replicaLabels map[string]struct{}) []*rulespb.Rule {
@@ -74,12 +195,9 @@ func dedupRules(rules []*rulespb.Rule, replicaLabels map[string]struct{}) []*rul
 		return rules
 	}
 
-	// Remove replica labels and sort each rule's label names such that they are comparable.
+	// Remove replica labels
 	for _, r := range rules {
 		removeReplicaLabels(r, replicaLabels)
-		sort.Slice(r.GetLabels(), func(i, j int) bool {
-			return r.GetLabels()[i].Name < r.GetLabels()[j].Name
-		})
 	}
 
 	// Sort rules globally.
@@ -118,14 +236,11 @@ func dedupRules(rules []*rulespb.Rule, replicaLabels map[string]struct{}) []*rul
 }
 
 func removeReplicaLabels(r *rulespb.Rule, replicaLabels map[string]struct{}) {
-	lbls := r.GetLabels()
-	newLabels := make(labels.Labels, 0, len(lbls))
-	for _, l := range lbls {
-		if _, ok := replicaLabels[l.Name]; !ok {
-			newLabels = append(newLabels, l)
-		}
+	b := labels.NewBuilder(r.GetLabels())
+	for k := range replicaLabels {
+		b.Del(k)
 	}
-	r.SetLabels(newLabels)
+	r.SetLabels(b.Labels())
 }
 
 func dedupGroups(groups []*rulespb.RuleGroup) []*rulespb.RuleGroup {
@@ -153,7 +268,7 @@ type rulesServer struct {
 	rulespb.Rules_RulesServer
 	ctx context.Context
 
-	warnings []error
+	warnings annotations.Annotations
 	groups   []*rulespb.RuleGroup
 	mu       sync.Mutex
 }
@@ -162,7 +277,7 @@ func (srv *rulesServer) Send(res *rulespb.RulesResponse) error {
 	if res.GetWarning() != "" {
 		srv.mu.Lock()
 		defer srv.mu.Unlock()
-		srv.warnings = append(srv.warnings, errors.New(res.GetWarning()))
+		srv.warnings.Add(errors.New(res.GetWarning()))
 		return nil
 	}
 

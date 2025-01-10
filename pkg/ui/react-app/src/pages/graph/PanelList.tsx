@@ -30,6 +30,9 @@ interface PanelListProps extends PathPrefixProps, RouteComponentProps {
   enableHighlighting: boolean;
   enableLinter: boolean;
   defaultStep: string;
+  defaultEngine: string;
+  queryMode: string;
+  usePartialResponse: boolean;
 }
 
 export const PanelListContent: FC<PanelListProps> = ({
@@ -42,6 +45,9 @@ export const PanelListContent: FC<PanelListProps> = ({
   enableHighlighting,
   enableLinter,
   defaultStep,
+  defaultEngine,
+  queryMode,
+  usePartialResponse,
   ...rest
 }) => {
   const [panels, setPanels] = useState(rest.panels);
@@ -55,8 +61,6 @@ export const PanelListContent: FC<PanelListProps> = ({
       storeList.push(...stores[type]);
     }
     setStoreData(storeList);
-    // Clear selected stores for each panel.
-    panels.forEach((panel: PanelMeta) => (panel.options.storeMatches = []));
     !panels.length && addPanel();
     window.onpopstate = () => {
       const panels = decodePanelOptionsFromQueryString(window.location.search);
@@ -95,6 +99,9 @@ export const PanelListContent: FC<PanelListProps> = ({
       },
     ]);
   };
+  const handleUsePartialResponseChange = (value: boolean): void => {
+    localStorage.setItem('usePartialResponse', JSON.stringify(value));
+  };
 
   return (
     <>
@@ -125,8 +132,12 @@ export const PanelListContent: FC<PanelListProps> = ({
           stores={storeData}
           enableAutocomplete={enableAutocomplete}
           enableHighlighting={enableHighlighting}
+          defaultEngine={defaultEngine}
+          queryMode={queryMode}
           enableLinter={enableLinter}
           defaultStep={defaultStep}
+          usePartialResponse={usePartialResponse}
+          onUsePartialResponseChange={handleUsePartialResponseChange}
         />
       ))}
       <Button className="d-block mb-3" color="primary" onClick={addPanel}>
@@ -142,7 +153,7 @@ const PanelList: FC<RouteComponentProps & PathPrefixProps> = ({ pathPrefix = '' 
   const [delta, setDelta] = useState(0);
   const [useLocalTime, setUseLocalTime] = useLocalStorage('use-local-time', false);
   const [enableQueryHistory, setEnableQueryHistory] = useLocalStorage('enable-query-history', false);
-  const [debugMode, setDebugMode] = useState(false);
+  const [enableStoreFiltering, setEnableStoreFiltering] = useLocalStorage('enable-store-filtering', false);
   const [enableAutocomplete, setEnableAutocomplete] = useLocalStorage('enable-autocomplete', true);
   const [enableHighlighting, setEnableHighlighting] = useLocalStorage('enable-syntax-highlighting', true);
   const [enableLinter, setEnableLinter] = useLocalStorage('enable-linter', true);
@@ -159,6 +170,9 @@ const PanelList: FC<RouteComponentProps & PathPrefixProps> = ({ pathPrefix = '' 
     isLoading: flagsLoading,
   } = useFetch<FlagMap>(`${pathPrefix}/api/v1/status/flags`);
   const defaultStep = flagsRes?.data?.['query.default-step'] || '1s';
+  const queryMode = flagsRes?.data?.['query.mode'];
+  const defaultEngine = queryMode == 'distributed' ? 'thanos' : flagsRes?.data?.['query.promql-engine'];
+  const usePartialResponse = flagsRes?.data?.['query.partial-response'] || true;
 
   const browserTime = new Date().getTime() / 1000;
   const { response: timeRes, error: timeErr } = useFetch<{ result: number[] }>(`${pathPrefix}/api/v1/query?query=time()`);
@@ -198,9 +212,9 @@ const PanelList: FC<RouteComponentProps & PathPrefixProps> = ({ pathPrefix = '' 
           </Checkbox>
           <Checkbox
             wrapperStyles={{ marginLeft: 20, display: 'inline-block' }}
-            id="debug-mode-checkbox"
-            defaultChecked={debugMode}
-            onChange={({ target }) => setDebugMode(target.checked)}
+            id="store-filtering-checkbox"
+            defaultChecked={enableStoreFiltering}
+            onChange={({ target }) => setEnableStoreFiltering(target.checked)}
           >
             Enable Store Filtering
           </Checkbox>
@@ -263,12 +277,15 @@ const PanelList: FC<RouteComponentProps & PathPrefixProps> = ({ pathPrefix = '' 
         pathPrefix={pathPrefix}
         useLocalTime={useLocalTime}
         metrics={metricsRes.data}
-        stores={debugMode ? storesRes.data : {}}
+        stores={enableStoreFiltering ? storesRes.data : {}}
         enableAutocomplete={enableAutocomplete}
         enableHighlighting={enableHighlighting}
         enableLinter={enableLinter}
         defaultStep={defaultStep}
+        defaultEngine={defaultEngine}
+        queryMode={queryMode}
         queryHistoryEnabled={enableQueryHistory}
+        usePartialResponse={!!usePartialResponse}
         isLoading={storesLoading || flagsLoading}
       />
     </>

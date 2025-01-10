@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -65,6 +64,7 @@ func (g Group) toProto() *rulespb.RuleGroup {
 					Name:                      rule.Name(),
 					Query:                     rule.Query().String(),
 					DurationSeconds:           rule.HoldDuration().Seconds(),
+					KeepFiringForSeconds:      rule.KeepFiringFor().Seconds(),
 					Labels:                    labelpb.ZLabelSet{Labels: labelpb.ZLabelsFromPromLabels(rule.Labels())},
 					Annotations:               labelpb.ZLabelSet{Labels: labelpb.ZLabelsFromPromLabels(rule.Annotations())},
 					Alerts:                    ActiveAlertsToProto(g.PartialResponseStrategy, rule),
@@ -98,12 +98,14 @@ func ActiveAlertsToProto(s storepb.PartialResponseStrategy, a *rules.AlertingRul
 	active := a.ActiveAlerts()
 	ret := make([]*rulespb.AlertInstance, len(active))
 	for i, ruleAlert := range active {
+		// UTC needed due to https://github.com/gogo/protobuf/issues/519.
+		activeAt := ruleAlert.ActiveAt.UTC()
 		ret[i] = &rulespb.AlertInstance{
 			PartialResponseStrategy: s,
 			Labels:                  labelpb.ZLabelSet{Labels: labelpb.ZLabelsFromPromLabels(ruleAlert.Labels)},
 			Annotations:             labelpb.ZLabelSet{Labels: labelpb.ZLabelsFromPromLabels(ruleAlert.Annotations)},
 			State:                   rulespb.AlertState(ruleAlert.State),
-			ActiveAt:                &ruleAlert.ActiveAt, //nolint:exportloopref
+			ActiveAt:                &activeAt,
 			Value:                   strconv.FormatFloat(ruleAlert.Value, 'e', -1, 64),
 		}
 	}
@@ -280,7 +282,7 @@ func (g configRuleAdapter) validate() (errs []error) {
 	return errs
 }
 
-// ValidateAndCount validates all rules in the rule groups and return overal number of rules in all groups.
+// ValidateAndCount validates all rules in the rule groups and return overall number of rules in all groups.
 // TODO(bwplotka): Replace this with upstream implementation after https://github.com/prometheus/prometheus/issues/7128 is fixed.
 func ValidateAndCount(group io.Reader) (numRules int, errs errutil.MultiError) {
 	var rgs configGroups
@@ -333,7 +335,7 @@ func (m *Manager) Update(evalInterval time.Duration, files []string) error {
 	}
 
 	for _, fn := range files {
-		b, err := ioutil.ReadFile(filepath.Clean(fn))
+		b, err := os.ReadFile(filepath.Clean(fn))
 		if err != nil {
 			errs.Add(err)
 			continue
@@ -365,7 +367,7 @@ func (m *Manager) Update(evalInterval time.Duration, files []string) error {
 				errs.Add(errors.Wrapf(err, "create %s", filepath.Dir(newFn)))
 				continue
 			}
-			if err := ioutil.WriteFile(newFn, b, os.ModePerm); err != nil {
+			if err := os.WriteFile(newFn, b, os.ModePerm); err != nil {
 				errs.Add(errors.Wrapf(err, "write file %v", newFn))
 				continue
 			}
@@ -382,7 +384,7 @@ func (m *Manager) Update(evalInterval time.Duration, files []string) error {
 			continue
 		}
 		// We add external labels in `pkg/alert.Queue`.
-		if err := mgr.Update(evalInterval, fs, nil, m.externalURL); err != nil {
+		if err := mgr.Update(evalInterval, fs, m.extLset, m.externalURL, nil); err != nil {
 			// TODO(bwplotka): Prometheus logs all error details. Fix it upstream to have consistent error handling.
 			errs.Add(errors.Wrapf(err, "strategy %s, update rules", s))
 			continue
@@ -400,7 +402,7 @@ func (m *Manager) Rules(r *rulespb.RulesRequest, s rulespb.Rules_RulesServer) (e
 
 	pgs := make([]*rulespb.RuleGroup, 0, len(groups))
 	for _, g := range groups {
-		// https://github.com/gogo/protobuf/issues/519
+		// UTC needed due to https://github.com/gogo/protobuf/issues/519.
 		g.LastEvaluation = g.LastEvaluation.UTC()
 		if r.Type == rulespb.RulesRequest_ALL {
 			pgs = append(pgs, g)

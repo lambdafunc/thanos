@@ -14,7 +14,6 @@ data/
 test/e2e/e2e_integration_test*
 
 # Ignore promu artifacts.
-/.build
 /.release
 /.tarballs
 
@@ -24,8 +23,5 @@ test/e2e/e2e_integration_test*
 website/public/
 website/docs-pre-processed/
 !website/data
-
-# React build assets
-pkg/ui/static/react
 
 tmp/

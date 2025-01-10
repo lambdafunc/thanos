@@ -5,7 +5,6 @@ package block
 
 import (
 	"context"
-	"io/ioutil"
 	"math"
 	"os"
 	"path/filepath"
@@ -17,25 +16,25 @@ import (
 	"github.com/prometheus/prometheus/tsdb/chunks"
 	"github.com/prometheus/prometheus/tsdb/index"
 
+	"github.com/efficientgo/core/testutil"
+
 	"github.com/thanos-io/thanos/pkg/block/metadata"
-	"github.com/thanos-io/thanos/pkg/testutil"
 	"github.com/thanos-io/thanos/pkg/testutil/e2eutil"
 )
 
 func TestRewrite(t *testing.T) {
 	ctx := context.Background()
 
-	tmpDir, err := ioutil.TempDir("", "test-indexheader")
-	testutil.Ok(t, err)
-	defer func() { testutil.Ok(t, os.RemoveAll(tmpDir)) }()
+	tmpDir := t.TempDir()
 
 	b, err := e2eutil.CreateBlock(ctx, tmpDir, []labels.Labels{
-		{{Name: "a", Value: "1"}},
-		{{Name: "a", Value: "2"}},
-		{{Name: "a", Value: "3"}},
-		{{Name: "a", Value: "4"}},
-		{{Name: "a", Value: "1"}, {Name: "b", Value: "1"}},
-	}, 150, 0, 1000, nil, 124, metadata.NoneFunc)
+		labels.New(labels.Label{Name: "a", Value: "1"}),
+		labels.New(labels.Label{Name: "a", Value: "2"}),
+		labels.New(labels.Label{Name: "a", Value: "3"}),
+		labels.New(labels.Label{Name: "a", Value: "4"}),
+		labels.New(labels.Label{Name: "a", Value: "1"}),
+		labels.New(labels.Label{Name: "b", Value: "1"}),
+	}, 150, 0, 1000, labels.EmptyLabels(), 124, metadata.NoneFunc)
 	testutil.Ok(t, err)
 
 	ir, err := index.NewFileReader(filepath.Join(tmpDir, b.String(), IndexFilename))
@@ -63,7 +62,7 @@ func TestRewrite(t *testing.T) {
 
 	defer cw.Close()
 
-	testutil.Ok(t, rewrite(log.NewNopLogger(), ir, cr, iw, cw, m, []ignoreFnType{func(mint, maxt int64, prev *chunks.Meta, curr *chunks.Meta) (bool, error) {
+	testutil.Ok(t, rewrite(ctx, log.NewNopLogger(), ir, cr, iw, cw, m, []ignoreFnType{func(mint, maxt int64, prev *chunks.Meta, curr *chunks.Meta) (bool, error) {
 		return curr.MaxTime == 696, nil
 	}}))
 
@@ -75,26 +74,23 @@ func TestRewrite(t *testing.T) {
 
 	defer func() { testutil.Ok(t, ir2.Close()) }()
 
-	all, err := ir2.Postings(index.AllPostingsKey())
+	key, value := index.AllPostingsKey()
+	all, err := ir2.Postings(ctx, key, value)
 	testutil.Ok(t, err)
 
 	for p := ir2.SortedPostings(all); p.Next(); {
-		var lset labels.Labels
+		var builder labels.ScratchBuilder
 		var chks []chunks.Meta
 
-		testutil.Ok(t, ir2.Series(p.At(), &lset, &chks))
+		testutil.Ok(t, ir2.Series(p.At(), &builder, &chks))
 		testutil.Equals(t, 1, len(chks))
 	}
 }
 
 func TestGatherIndexHealthStatsReturnsOutOfOrderChunksErr(t *testing.T) {
-	blockDir, err := ioutil.TempDir("", "test-ooo-index")
-	testutil.Ok(t, err)
+	ctx := context.Background()
 
-	err = testutil.PutOutOfOrderIndex(blockDir, 0, math.MaxInt64)
-	testutil.Ok(t, err)
-
-	stats, err := GatherIndexHealthStats(log.NewLogfmtLogger(os.Stderr), blockDir+"/"+IndexFilename, 0, math.MaxInt64)
+	stats, err := GatherIndexHealthStats(ctx, log.NewLogfmtLogger(os.Stderr), "testdata/out_of_order_chunks/index", 0, math.MaxInt64)
 
 	testutil.Ok(t, err)
 	testutil.Equals(t, 1, stats.OutOfOrderChunks)

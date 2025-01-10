@@ -18,7 +18,7 @@ import (
 // MemcachedCache is a memcached-based cache.
 type MemcachedCache struct {
 	logger    log.Logger
-	memcached cacheutil.MemcachedClient
+	memcached cacheutil.RemoteCacheClient
 	name      string
 
 	// Metrics.
@@ -27,7 +27,7 @@ type MemcachedCache struct {
 }
 
 // NewMemcachedCache makes a new MemcachedCache.
-func NewMemcachedCache(name string, logger log.Logger, memcached cacheutil.MemcachedClient, reg prometheus.Registerer) *MemcachedCache {
+func NewMemcachedCache(name string, logger log.Logger, memcached cacheutil.RemoteCacheClient, reg prometheus.Registerer) *MemcachedCache {
 	c := &MemcachedCache{
 		logger:    logger,
 		memcached: memcached,
@@ -54,14 +54,14 @@ func NewMemcachedCache(name string, logger log.Logger, memcached cacheutil.Memca
 // Store data identified by keys.
 // The function enqueues the request and returns immediately: the entry will be
 // asynchronously stored in the cache.
-func (c *MemcachedCache) Store(ctx context.Context, data map[string][]byte, ttl time.Duration) {
+func (c *MemcachedCache) Store(data map[string][]byte, ttl time.Duration) {
 	var (
 		firstErr error
 		failed   int
 	)
 
 	for key, val := range data {
-		if err := c.memcached.SetAsync(ctx, key, val, ttl); err != nil {
+		if err := c.memcached.SetAsync(key, val, ttl); err != nil {
 			failed++
 			if firstErr == nil {
 				firstErr = err

@@ -27,6 +27,10 @@ import (
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
 
+	"github.com/thanos-io/objstore"
+	"github.com/thanos-io/objstore/client"
+	objstoretracing "github.com/thanos-io/objstore/tracing/opentracing"
+
 	blocksAPI "github.com/thanos-io/thanos/pkg/api/blocks"
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
@@ -38,10 +42,12 @@ import (
 	"github.com/thanos-io/thanos/pkg/extprom"
 	extpromhttp "github.com/thanos-io/thanos/pkg/extprom/http"
 	"github.com/thanos-io/thanos/pkg/logging"
-	"github.com/thanos-io/thanos/pkg/objstore/client"
 	"github.com/thanos-io/thanos/pkg/prober"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	httpserver "github.com/thanos-io/thanos/pkg/server/http"
+	"github.com/thanos-io/thanos/pkg/store"
+	"github.com/thanos-io/thanos/pkg/strutil"
+	"github.com/thanos-io/thanos/pkg/tracing"
 	"github.com/thanos-io/thanos/pkg/ui"
 )
 
@@ -200,10 +206,11 @@ func runCompact(
 		return err
 	}
 
-	bkt, err := client.NewBucket(logger, confContentYaml, reg, component.String())
+	bkt, err := client.NewBucket(logger, confContentYaml, component.String(), nil)
 	if err != nil {
 		return err
 	}
+	insBkt := objstoretracing.WrapWithTraces(objstore.WrapWithMetrics(bkt, extprom.WrapRegistererWithPrefix("thanos_", reg), bkt.Name()))
 
 	relabelContentYaml, err := conf.selectorRelabelConf.Content()
 	if err != nil {
@@ -218,29 +225,41 @@ func runCompact(
 	// Ensure we close up everything properly.
 	defer func() {
 		if err != nil {
-			runutil.CloseWithLogOnErr(logger, bkt, "bucket client")
+			runutil.CloseWithLogOnErr(logger, insBkt, "bucket client")
 		}
 	}()
 
 	// While fetching blocks, we filter out blocks that were marked for deletion by using IgnoreDeletionMarkFilter.
 	// The delay of deleteDelay/2 is added to ensure we fetch blocks that are meant to be deleted but do not have a replacement yet.
 	// This is to make sure compactor will not accidentally perform compactions with gap instead.
-	ignoreDeletionMarkFilter := block.NewIgnoreDeletionMarkFilter(logger, bkt, deleteDelay/2, conf.blockMetaFetchConcurrency)
-	duplicateBlocksFilter := block.NewDeduplicateFilter()
-	noCompactMarkerFilter := compact.NewGatherNoCompactionMarkFilter(logger, bkt, conf.blockMetaFetchConcurrency)
+	ignoreDeletionMarkFilter := block.NewIgnoreDeletionMarkFilter(logger, insBkt, deleteDelay/2, conf.blockMetaFetchConcurrency)
+	duplicateBlocksFilter := block.NewDeduplicateFilter(conf.blockMetaFetchConcurrency)
+	noCompactMarkerFilter := compact.NewGatherNoCompactionMarkFilter(logger, insBkt, conf.blockMetaFetchConcurrency)
+	noDownsampleMarkerFilter := downsample.NewGatherNoDownsampleMarkFilter(logger, insBkt, conf.blockMetaFetchConcurrency)
 	labelShardedMetaFilter := block.NewLabelShardedMetaFilter(relabelConfig)
 	consistencyDelayMetaFilter := block.NewConsistencyDelayMetaFilter(logger, conf.consistencyDelay, extprom.WrapRegistererWithPrefix("thanos_", reg))
+	timePartitionMetaFilter := block.NewTimePartitionMetaFilter(conf.filterConf.MinTime, conf.filterConf.MaxTime)
 
-	baseMetaFetcher, err := block.NewBaseFetcher(logger, conf.blockMetaFetchConcurrency, bkt, "", extprom.WrapRegistererWithPrefix("thanos_", reg))
+	var blockLister block.Lister
+	switch syncStrategy(conf.blockListStrategy) {
+	case concurrentDiscovery:
+		blockLister = block.NewConcurrentLister(logger, insBkt)
+	case recursiveDiscovery:
+		blockLister = block.NewRecursiveLister(logger, insBkt)
+	default:
+		return errors.Errorf("unknown sync strategy %s", conf.blockListStrategy)
+	}
+	baseMetaFetcher, err := block.NewBaseFetcher(logger, conf.blockMetaFetchConcurrency, insBkt, blockLister, conf.dataDir, extprom.WrapRegistererWithPrefix("thanos_", reg))
 	if err != nil {
 		return errors.Wrap(err, "create meta fetcher")
 	}
 
 	enableVerticalCompaction := conf.enableVerticalCompaction
-	if len(conf.dedupReplicaLabels) > 0 {
+	dedupReplicaLabels := strutil.ParseFlagLabels(conf.dedupReplicaLabels)
+	if len(dedupReplicaLabels) > 0 {
 		enableVerticalCompaction = true
 		level.Info(logger).Log(
-			"msg", "deduplication.replica-label specified, enabling vertical compaction", "dedupReplicaLabels", strings.Join(conf.dedupReplicaLabels, ","),
+			"msg", "deduplication.replica-label specified, enabling vertical compaction", "dedupReplicaLabels", strings.Join(dedupReplicaLabels, ","),
 		)
 	}
 	if enableVerticalCompaction {
@@ -249,42 +268,44 @@ func runCompact(
 		)
 	}
 	var (
-		compactorView = ui.NewBucketUI(
-			logger,
-			conf.label,
-			conf.webConf.externalPrefix,
-			conf.webConf.prefixHeaderName,
-			"/loaded",
-			component,
-		)
-		api = blocksAPI.NewBlocksAPI(logger, conf.webConf.disableCORS, conf.label, flagsMap, bkt)
+		api = blocksAPI.NewBlocksAPI(logger, conf.webConf.disableCORS, conf.label, flagsMap, insBkt)
 		sy  *compact.Syncer
 	)
 	{
+		filters := []block.MetadataFilter{
+			timePartitionMetaFilter,
+			labelShardedMetaFilter,
+			consistencyDelayMetaFilter,
+			ignoreDeletionMarkFilter,
+			block.NewReplicaLabelRemover(logger, dedupReplicaLabels),
+			duplicateBlocksFilter,
+			noCompactMarkerFilter,
+		}
+		if !conf.disableDownsampling {
+			filters = append(filters, noDownsampleMarkerFilter)
+		}
 		// Make sure all compactor meta syncs are done through Syncer.SyncMeta for readability.
 		cf := baseMetaFetcher.NewMetaFetcher(
-			extprom.WrapRegistererWithPrefix("thanos_", reg), []block.MetadataFilter{
-				labelShardedMetaFilter,
-				consistencyDelayMetaFilter,
-				ignoreDeletionMarkFilter,
-				duplicateBlocksFilter,
-				noCompactMarkerFilter,
-			}, []block.MetadataModifier{block.NewReplicaLabelRemover(logger, conf.dedupReplicaLabels)},
-		)
+			extprom.WrapRegistererWithPrefix("thanos_", reg), filters)
 		cf.UpdateOnChange(func(blocks []metadata.Meta, err error) {
-			compactorView.Set(blocks, err)
 			api.SetLoaded(blocks, err)
 		})
+
+		var syncMetasTimeout = conf.waitInterval
+		if !conf.wait {
+			syncMetasTimeout = 0
+		}
 		sy, err = compact.NewMetaSyncer(
 			logger,
 			reg,
-			bkt,
+			insBkt,
 			cf,
 			duplicateBlocksFilter,
 			ignoreDeletionMarkFilter,
 			compactMetrics.blocksMarked.WithLabelValues(metadata.DeletionMarkFilename, ""),
 			compactMetrics.garbageCollectedBlocks,
-			conf.blockSyncConcurrency)
+			syncMetasTimeout,
+		)
 		if err != nil {
 			return errors.Wrap(err, "create syncer")
 		}
@@ -300,6 +321,7 @@ func runCompact(
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	ctx = tracing.ContextWithTracer(ctx, tracer)
 
 	defer func() {
 		if rerr != nil {
@@ -312,7 +334,7 @@ func runCompact(
 	case compact.DedupAlgorithmPenalty:
 		mergeFunc = dedup.NewChunkSeriesMerger()
 
-		if len(conf.dedupReplicaLabels) == 0 {
+		if len(dedupReplicaLabels) == 0 {
 			return errors.New("penalty based deduplication needs at least one replica label specified")
 		}
 	case "":
@@ -344,7 +366,7 @@ func runCompact(
 
 	grouper := compact.NewDefaultGrouper(
 		logger,
-		bkt,
+		insBkt,
 		conf.acceptMalformedIndex,
 		enableVerticalCompaction,
 		reg,
@@ -352,15 +374,24 @@ func runCompact(
 		compactMetrics.garbageCollectedBlocks,
 		compactMetrics.blocksMarked.WithLabelValues(metadata.NoCompactMarkFilename, metadata.OutOfOrderChunksNoCompactReason),
 		metadata.HashFunc(conf.hashFunc),
+		conf.blockFilesConcurrency,
+		conf.compactBlocksFetchConcurrency,
 	)
+	var planner compact.Planner
+
 	tsdbPlanner := compact.NewPlanner(logger, levels, noCompactMarkerFilter)
-	planner := compact.WithLargeTotalIndexSizeFilter(
+	largeIndexFilterPlanner := compact.WithLargeTotalIndexSizeFilter(
 		tsdbPlanner,
-		bkt,
+		insBkt,
 		int64(conf.maxBlockIndexSize),
 		compactMetrics.blocksMarked.WithLabelValues(metadata.NoCompactMarkFilename, metadata.IndexSizeExceedingNoCompactReason),
 	)
-	blocksCleaner := compact.NewBlocksCleaner(logger, bkt, ignoreDeletionMarkFilter, deleteDelay, compactMetrics.blocksCleaned, compactMetrics.blockCleanupFailures)
+	if enableVerticalCompaction {
+		planner = compact.WithVerticalCompactionDownsampleFilter(largeIndexFilterPlanner, insBkt, compactMetrics.blocksMarked.WithLabelValues(metadata.NoCompactMarkFilename, metadata.DownsampleVerticalCompactionNoCompactReason))
+	} else {
+		planner = largeIndexFilterPlanner
+	}
+	blocksCleaner := compact.NewBlocksCleaner(logger, insBkt, ignoreDeletionMarkFilter, deleteDelay, compactMetrics.blocksCleaned, compactMetrics.blockCleanupFailures)
 	compactor, err := compact.NewBucketCompactor(
 		logger,
 		sy,
@@ -368,7 +399,7 @@ func runCompact(
 		planner,
 		comp,
 		compactDir,
-		bkt,
+		insBkt,
 		conf.compactionConcurrency,
 		conf.skipBlockWithOutOfOrderChunks,
 	)
@@ -382,13 +413,21 @@ func runCompact(
 		compact.ResolutionLevel1h:  time.Duration(conf.retentionOneHr),
 	}
 
-	if retentionByResolution[compact.ResolutionLevelRaw].Seconds() != 0 {
+	if retentionByResolution[compact.ResolutionLevelRaw].Milliseconds() != 0 {
+		// If downsampling is enabled, error if raw retention is not sufficient for downsampling to occur (upper bound 10 days for 1h resolution)
+		if !conf.disableDownsampling && retentionByResolution[compact.ResolutionLevelRaw].Milliseconds() < downsample.ResLevel1DownsampleRange {
+			return errors.New("raw resolution must be higher than the minimum block size after which 5m resolution downsampling will occur (40 hours)")
+		}
 		level.Info(logger).Log("msg", "retention policy of raw samples is enabled", "duration", retentionByResolution[compact.ResolutionLevelRaw])
 	}
-	if retentionByResolution[compact.ResolutionLevel5m].Seconds() != 0 {
+	if retentionByResolution[compact.ResolutionLevel5m].Milliseconds() != 0 {
+		// If retention is lower than minimum downsample range, then no downsampling at this resolution will be persisted
+		if !conf.disableDownsampling && retentionByResolution[compact.ResolutionLevel5m].Milliseconds() < downsample.ResLevel2DownsampleRange {
+			return errors.New("5m resolution retention must be higher than the minimum block size after which 1h resolution downsampling will occur (10 days)")
+		}
 		level.Info(logger).Log("msg", "retention policy of 5 min aggregated samples is enabled", "duration", retentionByResolution[compact.ResolutionLevel5m])
 	}
-	if retentionByResolution[compact.ResolutionLevel1h].Seconds() != 0 {
+	if retentionByResolution[compact.ResolutionLevel1h].Milliseconds() != 0 {
 		level.Info(logger).Log("msg", "retention policy of 1 hour aggregated samples is enabled", "duration", retentionByResolution[compact.ResolutionLevel1h])
 	}
 
@@ -399,11 +438,10 @@ func runCompact(
 		defer cleanMtx.Unlock()
 
 		if err := sy.SyncMetas(ctx); err != nil {
-			cancel()
 			return errors.Wrap(err, "syncing metas")
 		}
 
-		compact.BestEffortCleanAbortedPartialUploads(ctx, logger, sy.Partial(), bkt, compactMetrics.partialUploadDeleteAttempts, compactMetrics.blocksCleaned, compactMetrics.blockCleanupFailures)
+		compact.BestEffortCleanAbortedPartialUploads(ctx, logger, sy.Partial(), insBkt, compactMetrics.partialUploadDeleteAttempts, compactMetrics.blocksCleaned, compactMetrics.blockCleanupFailures)
 		if err := blocksCleaner.DeleteMarkedBlocks(ctx); err != nil {
 			return errors.Wrap(err, "cleaning marked blocks")
 		}
@@ -426,12 +464,30 @@ func runCompact(
 				return errors.Wrap(err, "sync before first pass of downsampling")
 			}
 
-			for _, meta := range sy.Metas() {
-				groupKey := compact.DefaultGroupKey(meta.Thanos)
-				downsampleMetrics.downsamples.WithLabelValues(groupKey)
-				downsampleMetrics.downsampleFailures.WithLabelValues(groupKey)
+			filteredMetas := sy.Metas()
+			noDownsampleBlocks := noDownsampleMarkerFilter.NoDownsampleMarkedBlocks()
+			for ul := range noDownsampleBlocks {
+				delete(filteredMetas, ul)
 			}
-			if err := downsampleBucket(ctx, logger, downsampleMetrics, bkt, sy.Metas(), downsamplingDir, conf.downsampleConcurrency, metadata.HashFunc(conf.hashFunc)); err != nil {
+
+			for _, meta := range filteredMetas {
+				resolutionLabel := meta.Thanos.ResolutionString()
+				downsampleMetrics.downsamples.WithLabelValues(resolutionLabel)
+				downsampleMetrics.downsampleFailures.WithLabelValues(resolutionLabel)
+			}
+
+			if err := downsampleBucket(
+				ctx,
+				logger,
+				downsampleMetrics,
+				insBkt,
+				filteredMetas,
+				downsamplingDir,
+				conf.downsampleConcurrency,
+				conf.blockFilesConcurrency,
+				metadata.HashFunc(conf.hashFunc),
+				conf.acceptMalformedIndex,
+			); err != nil {
 				return errors.Wrap(err, "first pass of downsampling failed")
 			}
 
@@ -439,9 +495,30 @@ func runCompact(
 			if err := sy.SyncMetas(ctx); err != nil {
 				return errors.Wrap(err, "sync before second pass of downsampling")
 			}
-			if err := downsampleBucket(ctx, logger, downsampleMetrics, bkt, sy.Metas(), downsamplingDir, conf.downsampleConcurrency, metadata.HashFunc(conf.hashFunc)); err != nil {
+
+			// Regenerate the filtered list of blocks after the sync,
+			// to include the blocks created by the first pass.
+			filteredMetas = sy.Metas()
+			noDownsampleBlocks = noDownsampleMarkerFilter.NoDownsampleMarkedBlocks()
+			for ul := range noDownsampleBlocks {
+				delete(filteredMetas, ul)
+			}
+
+			if err := downsampleBucket(
+				ctx,
+				logger,
+				downsampleMetrics,
+				insBkt,
+				filteredMetas,
+				downsamplingDir,
+				conf.downsampleConcurrency,
+				conf.blockFilesConcurrency,
+				metadata.HashFunc(conf.hashFunc),
+				conf.acceptMalformedIndex,
+			); err != nil {
 				return errors.Wrap(err, "second pass of downsampling failed")
 			}
+
 			level.Info(logger).Log("msg", "downsampling iterations done")
 		} else {
 			level.Info(logger).Log("msg", "downsampling was explicitly disabled")
@@ -452,7 +529,7 @@ func runCompact(
 			return errors.Wrap(err, "sync before retention")
 		}
 
-		if err := compact.ApplyRetentionPolicyByResolution(ctx, logger, bkt, sy.Metas(), retentionByResolution, compactMetrics.blocksMarked.WithLabelValues(metadata.DeletionMarkFilename, "")); err != nil {
+		if err := compact.ApplyRetentionPolicyByResolution(ctx, logger, insBkt, sy.Metas(), retentionByResolution, compactMetrics.blocksMarked.WithLabelValues(metadata.DeletionMarkFilename, "")); err != nil {
 			return errors.Wrap(err, "retention failed")
 		}
 
@@ -460,7 +537,7 @@ func runCompact(
 	}
 
 	g.Add(func() error {
-		defer runutil.CloseWithLogOnErr(logger, bkt, "bucket client")
+		defer runutil.CloseWithLogOnErr(logger, insBkt, "bucket client")
 
 		if !conf.wait {
 			return compactMainFn()
@@ -502,36 +579,67 @@ func runCompact(
 	})
 
 	if conf.wait {
-		r := route.New()
+		if !conf.disableWeb {
+			r := route.New()
 
-		ins := extpromhttp.NewInstrumentationMiddleware(reg, nil)
-		compactorView.Register(r, true, ins)
+			ins := extpromhttp.NewInstrumentationMiddleware(reg, nil)
 
-		global := ui.NewBucketUI(logger, conf.label, conf.webConf.externalPrefix, conf.webConf.prefixHeaderName, "/global", component)
-		global.Register(r, false, ins)
+			global := ui.NewBucketUI(logger, conf.webConf.externalPrefix, conf.webConf.prefixHeaderName, component)
+			global.Register(r, ins)
 
-		// Configure Request Logging for HTTP calls.
-		opts := []logging.Option{logging.WithDecider(func(_ string, _ error) logging.Decision {
-			return logging.NoLogCall
-		})}
-		logMiddleware := logging.NewHTTPServerMiddleware(logger, opts...)
-		api.Register(r.WithPrefix("/api/v1"), tracer, logger, ins, logMiddleware)
+			// Configure Request Logging for HTTP calls.
+			opts := []logging.Option{logging.WithDecider(func(_ string, _ error) logging.Decision {
+				return logging.NoLogCall
+			})}
+			logMiddleware := logging.NewHTTPServerMiddleware(logger, opts...)
+			api.Register(r.WithPrefix("/api/v1"), tracer, logger, ins, logMiddleware)
 
-		// Separate fetcher for global view.
-		// TODO(bwplotka): Allow Bucket UI to visualize the state of the block as well.
-		f := baseMetaFetcher.NewMetaFetcher(extprom.WrapRegistererWithPrefix("thanos_bucket_ui", reg), nil, nil, "component", "globalBucketUI")
-		f.UpdateOnChange(func(blocks []metadata.Meta, err error) {
-			global.Set(blocks, err)
-			api.SetGlobal(blocks, err)
-		})
+			// Separate fetcher for global view.
+			// TODO(bwplotka): Allow Bucket UI to visualize the state of the block as well.
+			f := baseMetaFetcher.NewMetaFetcher(extprom.WrapRegistererWithPrefix("thanos_bucket_ui", reg), nil, "component", "globalBucketUI")
+			f.UpdateOnChange(func(blocks []metadata.Meta, err error) {
+				api.SetGlobal(blocks, err)
+			})
 
-		srv.Handle("/", r)
+			srv.Handle("/", r)
+
+			g.Add(func() error {
+				iterCtx, iterCancel := context.WithTimeout(ctx, conf.blockViewerSyncBlockTimeout)
+				_, _, _ = f.Fetch(iterCtx)
+				iterCancel()
+
+				// For /global state make sure to fetch periodically.
+				return runutil.Repeat(conf.blockViewerSyncBlockInterval, ctx.Done(), func() error {
+					return runutil.RetryWithLog(logger, time.Minute, ctx.Done(), func() error {
+						iterCtx, iterCancel := context.WithTimeout(ctx, conf.blockViewerSyncBlockTimeout)
+						defer iterCancel()
+
+						_, _, err := f.Fetch(iterCtx)
+						return err
+					})
+				})
+			}, func(error) {
+				cancel()
+			})
+		}
 
 		// Periodically remove partial blocks and blocks marked for deletion
 		// since one iteration potentially could take a long time.
 		if conf.cleanupBlocksInterval > 0 {
 			g.Add(func() error {
-				return runutil.Repeat(conf.cleanupBlocksInterval, ctx.Done(), cleanPartialMarked)
+				return runutil.Repeat(conf.cleanupBlocksInterval, ctx.Done(), func() error {
+					err := cleanPartialMarked()
+					if err != nil && compact.IsRetryError(err) {
+						// The RetryError signals that we hit an retriable error (transient error, no connection).
+						// You should alert on this being triggered too frequently.
+						level.Error(logger).Log("msg", "retriable error", "err", err)
+						compactMetrics.retried.Inc()
+
+						return nil
+					}
+
+					return err
+				})
 			}, func(error) {
 				cancel()
 			})
@@ -550,6 +658,15 @@ func runCompact(
 				return runutil.Repeat(conf.progressCalculateInterval, ctx.Done(), func() error {
 
 					if err := sy.SyncMetas(ctx); err != nil {
+						// The RetryError signals that we hit an retriable error (transient error, no connection).
+						// You should alert on this being triggered too frequently.
+						if compact.IsRetryError(err) {
+							level.Error(logger).Log("msg", "retriable error", "err", err)
+							compactMetrics.retried.Inc()
+
+							return nil
+						}
+
 						return errors.Wrapf(err, "could not sync metas")
 					}
 
@@ -588,25 +705,6 @@ func runCompact(
 				cancel()
 			})
 		}
-
-		g.Add(func() error {
-			iterCtx, iterCancel := context.WithTimeout(ctx, conf.blockViewerSyncBlockTimeout)
-			_, _, _ = f.Fetch(iterCtx)
-			iterCancel()
-
-			// For /global state make sure to fetch periodically.
-			return runutil.Repeat(conf.blockViewerSyncBlockInterval, ctx.Done(), func() error {
-				return runutil.RetryWithLog(logger, time.Minute, ctx.Done(), func() error {
-					iterCtx, iterCancel := context.WithTimeout(ctx, conf.blockViewerSyncBlockTimeout)
-					defer iterCancel()
-
-					_, _, err := f.Fetch(iterCtx)
-					return err
-				})
-			})
-		}, func(error) {
-			cancel()
-		})
 	}
 
 	level.Info(logger).Log("msg", "starting compact node")
@@ -626,16 +724,19 @@ type compactConfig struct {
 	wait                                           bool
 	waitInterval                                   time.Duration
 	disableDownsampling                            bool
-	blockSyncConcurrency                           int
+	blockListStrategy                              string
 	blockMetaFetchConcurrency                      int
+	blockFilesConcurrency                          int
 	blockViewerSyncBlockInterval                   time.Duration
 	blockViewerSyncBlockTimeout                    time.Duration
 	cleanupBlocksInterval                          time.Duration
 	compactionConcurrency                          int
 	downsampleConcurrency                          int
+	compactBlocksFetchConcurrency                  int
 	deleteDelay                                    model.Duration
 	dedupReplicaLabels                             []string
 	selectorRelabelConf                            extflag.PathOrContent
+	disableWeb                                     bool
 	webConf                                        webConfig
 	label                                          string
 	maxBlockIndexSize                              units.Base2Bytes
@@ -644,13 +745,15 @@ type compactConfig struct {
 	dedupFunc                                      string
 	skipBlockWithOutOfOrderChunks                  bool
 	progressCalculateInterval                      time.Duration
+	filterConf                                     *store.FilterConfig
+	disableAdminOperations                         bool
 }
 
 func (cc *compactConfig) registerFlag(cmd extkingpin.FlagClause) {
 	cmd.Flag("debug.halt-on-error", "Halt the process if a critical compaction error is detected.").
 		Hidden().Default("true").BoolVar(&cc.haltOnError)
 	cmd.Flag("debug.accept-malformed-index",
-		"Compaction index verification will ignore out of order label names.").
+		"Compaction and downsampling index verification will ignore out of order label names.").
 		Hidden().Default("false").BoolVar(&cc.acceptMalformedIndex)
 	cmd.Flag("debug.max-compaction-level", fmt.Sprintf("Maximum compaction level, default is %d: %s", compactions.maxLevel(), compactions.String())).
 		Hidden().Default(strconv.Itoa(compactions.maxLevel())).IntVar(&cc.maxCompactionLevel)
@@ -683,10 +786,13 @@ func (cc *compactConfig) registerFlag(cmd extkingpin.FlagClause) {
 		"as querying long time ranges without non-downsampled data is not efficient and useful e.g it is not possible to render all samples for a human eye anyway").
 		Default("false").BoolVar(&cc.disableDownsampling)
 
-	cmd.Flag("block-sync-concurrency", "Number of goroutines to use when syncing block metadata from object storage.").
-		Default("20").IntVar(&cc.blockSyncConcurrency)
+	strategies := strings.Join([]string{string(concurrentDiscovery), string(recursiveDiscovery)}, ", ")
+	cmd.Flag("block-discovery-strategy", "One of "+strategies+". When set to concurrent, stores will concurrently issue one call per directory to discover active blocks in the bucket. The recursive strategy iterates through all objects in the bucket, recursively traversing into each directory. This avoids N+1 calls at the expense of having slower bucket iterations.").
+		Default(string(concurrentDiscovery)).StringVar(&cc.blockListStrategy)
 	cmd.Flag("block-meta-fetch-concurrency", "Number of goroutines to use when fetching block metadata from object storage.").
 		Default("32").IntVar(&cc.blockMetaFetchConcurrency)
+	cmd.Flag("block-files-concurrency", "Number of goroutines to use when fetching/uploading block files from object storage.").
+		Default("1").IntVar(&cc.blockFilesConcurrency)
 	cmd.Flag("block-viewer.global.sync-block-interval", "Repeat interval for syncing the blocks between local and remote view for /global Block Viewer UI.").
 		Default("1m").DurationVar(&cc.blockViewerSyncBlockInterval)
 	cmd.Flag("block-viewer.global.sync-block-timeout", "Maximum time for syncing the blocks between local and remote view for /global Block Viewer UI.").
@@ -698,6 +804,8 @@ func (cc *compactConfig) registerFlag(cmd extkingpin.FlagClause) {
 
 	cmd.Flag("compact.concurrency", "Number of goroutines to use when compacting groups.").
 		Default("1").IntVar(&cc.compactionConcurrency)
+	cmd.Flag("compact.blocks-fetch-concurrency", "Number of goroutines to use when download block during compaction.").
+		Default("1").IntVar(&cc.compactBlocksFetchConcurrency)
 	cmd.Flag("downsample.concurrency", "Number of goroutines to use when downsampling blocks.").
 		Default("1").IntVar(&cc.downsampleConcurrency)
 
@@ -718,8 +826,9 @@ func (cc *compactConfig) registerFlag(cmd extkingpin.FlagClause) {
 		"When set to penalty, penalty based deduplication algorithm will be used. At least one replica label has to be set via --deduplication.replica-label flag.").
 		Default("").EnumVar(&cc.dedupFunc, compact.DedupAlgorithmPenalty, "")
 
-	cmd.Flag("deduplication.replica-label", "Label to treat as a replica indicator of blocks that can be deduplicated (repeated flag). This will merge multiple replica blocks into one. This process is irreversible."+
-		"Experimental. When one or more labels are set, compactor will ignore the given labels so that vertical compaction can merge the blocks."+
+	cmd.Flag("deduplication.replica-label", "Experimental. Label to treat as a replica indicator of blocks that can be deduplicated (repeated flag). This will merge multiple replica blocks into one. This process is irreversible. "+
+		"Flag may be specified multiple times as well as a comma separated list of labels. "+
+		"When one or more labels are set, compactor will ignore the given labels so that vertical compaction can merge the blocks."+
 		"Please note that by default this uses a NAIVE algorithm for merging which works well for deduplication of blocks with **precisely the same samples** like produced by Receiver replication."+
 		"If you need a different deduplication algorithm (e.g one that works well with Prometheus replicas), please set it via --deduplication.func.").
 		StringsVar(&cc.dedupReplicaLabels)
@@ -737,9 +846,19 @@ func (cc *compactConfig) registerFlag(cmd extkingpin.FlagClause) {
 	cmd.Flag("hash-func", "Specify which hash function to use when calculating the hashes of produced files. If no function has been specified, it does not happen. This permits avoiding downloading some files twice albeit at some performance cost. Possible values are: \"\", \"SHA256\".").
 		Default("").EnumVar(&cc.hashFunc, "SHA256", "")
 
+	cc.filterConf = &store.FilterConfig{}
+	cmd.Flag("min-time", "Start of time range limit to compact. Thanos Compactor will compact only blocks, which happened later than this value. Option can be a constant time in RFC3339 format or time duration relative to current time, such as -1d or 2h45m. Valid duration units are ms, s, m, h, d, w, y.").
+		Default("0000-01-01T00:00:00Z").SetValue(&cc.filterConf.MinTime)
+	cmd.Flag("max-time", "End of time range limit to compact. Thanos Compactor will compact only blocks, which happened earlier than this value. Option can be a constant time in RFC3339 format or time duration relative to current time, such as -1d or 2h45m. Valid duration units are ms, s, m, h, d, w, y.").
+		Default("9999-12-31T23:59:59Z").SetValue(&cc.filterConf.MaxTime)
+
+	cmd.Flag("web.disable", "Disable Block Viewer UI.").Default("false").BoolVar(&cc.disableWeb)
+
 	cc.selectorRelabelConf = *extkingpin.RegisterSelectorRelabelFlags(cmd)
 
 	cc.webConf.registerFlag(cmd)
 
-	cmd.Flag("bucket-web-label", "Prometheus label to use as timeline title in the bucket web UI").StringVar(&cc.label)
+	cmd.Flag("bucket-web-label", "External block label to use as group title in the bucket web UI").StringVar(&cc.label)
+
+	cmd.Flag("disable-admin-operations", "Disable UI/API admin operations like marking blocks for deletion and no compaction.").Default("false").BoolVar(&cc.disableAdminOperations)
 }

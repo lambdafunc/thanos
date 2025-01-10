@@ -7,8 +7,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"io/ioutil"
-	"os"
 	"path"
 	"testing"
 	"time"
@@ -16,22 +14,20 @@ import (
 	"github.com/go-kit/log"
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
-	"go.uber.org/goleak"
+	"github.com/thanos-io/objstore"
+	"github.com/thanos-io/thanos/pkg/testutil/custom"
 
-	"github.com/thanos-io/thanos/pkg/objstore"
-	"github.com/thanos-io/thanos/pkg/testutil"
+	"github.com/efficientgo/core/testutil"
 )
 
 func TestMain(m *testing.M) {
-	goleak.VerifyTestMain(m)
+	custom.TolerantVerifyLeakMain(m)
 }
 
 func TestReadMarker(t *testing.T) {
 	ctx := context.Background()
 
-	tmpDir, err := ioutil.TempDir("", "test-read-mark")
-	testutil.Ok(t, err)
-	defer func() { testutil.Ok(t, os.RemoveAll(tmpDir)) }()
+	tmpDir := t.TempDir()
 
 	bkt := objstore.WithNoopInstr(objstore.NewInMemBucket())
 	t.Run(DeletionMarkFilename, func(t *testing.T) {

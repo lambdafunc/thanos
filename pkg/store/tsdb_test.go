@@ -7,30 +7,30 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"math/rand"
-	"os"
 	"sort"
 	"testing"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/go-kit/log"
 	"github.com/prometheus/prometheus/model/labels"
-	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
+
+	"github.com/efficientgo/core/testutil"
 
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	storetestutil "github.com/thanos-io/thanos/pkg/store/storepb/testutil"
-	"github.com/thanos-io/thanos/pkg/testutil"
+	"github.com/thanos-io/thanos/pkg/testutil/custom"
 	"github.com/thanos-io/thanos/pkg/testutil/e2eutil"
 )
 
 const skipMessage = "Chunk behavior changed due to https://github.com/prometheus/prometheus/pull/8723. Skip for now."
 
-func TestTSDBStore_Info(t *testing.T) {
-	defer testutil.TolerantVerifyLeak(t)
+func TestTSDBStore_Series_ChunkChecksum(t *testing.T) {
+	defer custom.TolerantVerifyLeak(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -41,30 +41,36 @@ func TestTSDBStore_Info(t *testing.T) {
 
 	tsdbStore := NewTSDBStore(nil, db, component.Rule, labels.FromStrings("region", "eu-west"))
 
-	resp, err := tsdbStore.Info(ctx, &storepb.InfoRequest{})
+	appender := db.Appender(context.Background())
+
+	for i := 1; i <= 3; i++ {
+		_, err = appender.Append(0, labels.FromStrings("a", "1"), int64(i), float64(i))
+		testutil.Ok(t, err)
+	}
+	err = appender.Commit()
 	testutil.Ok(t, err)
 
-	testutil.Equals(t, []labelpb.ZLabel{{Name: "region", Value: "eu-west"}}, resp.Labels)
-	testutil.Equals(t, storepb.StoreType_RULE, resp.StoreType)
-	testutil.Equals(t, int64(math.MaxInt64), resp.MinTime)
-	testutil.Equals(t, int64(math.MaxInt64), resp.MaxTime)
+	srv := newStoreSeriesServer(ctx)
 
-	app := db.Appender(context.Background())
-	_, err = app.Append(0, labels.FromStrings("a", "a"), 12, 0.1)
+	req := &storepb.SeriesRequest{
+		MinTime: 1,
+		MaxTime: 3,
+		Matchers: []storepb.LabelMatcher{
+			{Type: storepb.LabelMatcher_EQ, Name: "a", Value: "1"},
+		},
+	}
+
+	err = tsdbStore.Series(req, srv)
 	testutil.Ok(t, err)
-	testutil.Ok(t, app.Commit())
 
-	resp, err = tsdbStore.Info(ctx, &storepb.InfoRequest{})
-	testutil.Ok(t, err)
-
-	testutil.Equals(t, []labelpb.ZLabel{{Name: "region", Value: "eu-west"}}, resp.Labels)
-	testutil.Equals(t, storepb.StoreType_RULE, resp.StoreType)
-	testutil.Equals(t, int64(12), resp.MinTime)
-	testutil.Equals(t, int64(math.MaxInt64), resp.MaxTime)
+	for _, chk := range srv.SeriesSet[0].Chunks {
+		want := xxhash.Sum64(chk.Raw.Data)
+		testutil.Equals(t, want, chk.Raw.Hash)
+	}
 }
 
 func TestTSDBStore_Series(t *testing.T) {
-	defer testutil.TolerantVerifyLeak(t)
+	defer custom.TolerantVerifyLeak(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -118,12 +124,12 @@ func TestTSDBStore_Series(t *testing.T) {
 			expectedSeries: []rawSeries{
 				{
 					lset:   labels.FromStrings("a", "1", "region", "eu-west"),
-					chunks: [][]sample{{{1, 1}, {2, 2}}},
+					chunks: [][]sample{{{1, 1}, {2, 2}, {3, 3}}},
 				},
 			},
 		},
 		{
-			title: "dont't match time range series",
+			title: "don't match time range series",
 			req: &storepb.SeriesRequest{
 				MinTime: 4,
 				MaxTime: 6,
@@ -145,7 +151,7 @@ func TestTSDBStore_Series(t *testing.T) {
 			expectedError: "rpc error: code = InvalidArgument desc = no matchers specified (excluding external labels)",
 		},
 		{
-			title: "dont't match labels",
+			title: "don't match labels",
 			req: &storepb.SeriesRequest{
 				MinTime: 1,
 				MaxTime: 3,
@@ -188,34 +194,6 @@ func TestTSDBStore_Series(t *testing.T) {
 	}
 }
 
-func TestTSDBStore_LabelAPIs(t *testing.T) {
-	t.Cleanup(func() { testutil.TolerantVerifyLeak(t) })
-	testLabelAPIs(t, func(extLset labels.Labels, appendFn func(app storage.Appender)) storepb.StoreServer {
-		db, err := e2eutil.NewTSDB()
-		testutil.Ok(t, err)
-		t.Cleanup(func() { testutil.Ok(t, db.Close()) })
-
-		tsdbStore := NewTSDBStore(nil, db, component.Rule, extLset)
-
-		appendFn(db.Appender(context.Background()))
-		return tsdbStore
-	})
-}
-
-// Regression test for https://github.com/thanos-io/thanos/issues/1038.
-func TestTSDBStore_Series_SplitSamplesIntoChunksWithMaxSizeOf120(t *testing.T) {
-	defer testutil.TolerantVerifyLeak(t)
-
-	db, err := e2eutil.NewTSDB()
-	defer func() { testutil.Ok(t, db.Close()) }()
-	testutil.Ok(t, err)
-
-	testSeries_SplitSamplesIntoChunksWithMaxSizeOf120(t, db.Appender(context.Background()), func() storepb.StoreServer {
-		return NewTSDBStore(nil, db, component.Rule, labels.FromStrings("region", "eu-west"))
-
-	})
-}
-
 type delegatorServer struct {
 	*storetestutil.SeriesServer
 
@@ -230,11 +208,7 @@ func (s *delegatorServer) Delegate(c io.Closer) {
 func TestTSDBStore_SeriesAccessWithDelegateClosing(t *testing.T) {
 	t.Skip(skipMessage)
 
-	tmpDir, err := ioutil.TempDir("", "test")
-	testutil.Ok(t, err)
-	t.Cleanup(func() {
-		testutil.Ok(t, os.RemoveAll(tmpDir))
-	})
+	tmpDir := t.TempDir()
 
 	var (
 		random = rand.New(rand.NewSource(120))
@@ -249,7 +223,7 @@ func TestTSDBStore_SeriesAccessWithDelegateClosing(t *testing.T) {
 		Random:           random,
 		SkipChunks:       true,
 	})
-	_ = createBlockFromHead(t, tmpDir, head)
+	_ = storetestutil.CreateBlockFromHead(t, tmpDir, head)
 	testutil.Ok(t, head.Close())
 
 	head, _ = storetestutil.CreateHeadWithSeries(t, 1, storetestutil.HeadGenOptions{
@@ -262,7 +236,7 @@ func TestTSDBStore_SeriesAccessWithDelegateClosing(t *testing.T) {
 	})
 	testutil.Ok(t, head.Close())
 
-	db, err := tsdb.OpenDBReadOnly(tmpDir, logger)
+	db, err := tsdb.OpenDBReadOnly(tmpDir, "", logger)
 	testutil.Ok(t, err)
 
 	dbToClose := make(chan *tsdb.DBReadOnly, 1)
@@ -403,11 +377,7 @@ func TestTSDBStore_SeriesAccessWithDelegateClosing(t *testing.T) {
 func TestTSDBStore_SeriesAccessWithoutDelegateClosing(t *testing.T) {
 	t.Skip(skipMessage)
 
-	tmpDir, err := ioutil.TempDir("", "test")
-	testutil.Ok(t, err)
-	t.Cleanup(func() {
-		testutil.Ok(t, os.RemoveAll(tmpDir))
-	})
+	tmpDir := t.TempDir()
 
 	var (
 		random = rand.New(rand.NewSource(120))
@@ -422,7 +392,7 @@ func TestTSDBStore_SeriesAccessWithoutDelegateClosing(t *testing.T) {
 		Random:           random,
 		SkipChunks:       true,
 	})
-	_ = createBlockFromHead(t, tmpDir, head)
+	_ = storetestutil.CreateBlockFromHead(t, tmpDir, head)
 	testutil.Ok(t, head.Close())
 
 	head, _ = storetestutil.CreateHeadWithSeries(t, 1, storetestutil.HeadGenOptions{
@@ -435,7 +405,7 @@ func TestTSDBStore_SeriesAccessWithoutDelegateClosing(t *testing.T) {
 	})
 	testutil.Ok(t, head.Close())
 
-	db, err := tsdb.OpenDBReadOnly(tmpDir, logger)
+	db, err := tsdb.OpenDBReadOnly(tmpDir, "", logger)
 	testutil.Ok(t, err)
 	t.Cleanup(func() {
 		if db != nil {
@@ -516,11 +486,9 @@ func TestTSDBStore_SeriesAccessWithoutDelegateClosing(t *testing.T) {
 }
 
 func TestTSDBStoreSeries(t *testing.T) {
-	tb := testutil.NewTB(t)
-	// Make sure there are more samples, so we can check framing code.
-	storetestutil.RunSeriesInterestingCases(tb, 10e6, 200e3, func(t testutil.TB, samplesPerSeries, series int) {
-		benchTSDBStoreSeries(t, samplesPerSeries, series)
-	})
+	t.Parallel()
+
+	benchTSDBStoreSeries(testutil.NewTB(t), 10_000, 1)
 }
 
 func BenchmarkTSDBStoreSeries(b *testing.B) {
@@ -531,11 +499,7 @@ func BenchmarkTSDBStoreSeries(b *testing.B) {
 }
 
 func benchTSDBStoreSeries(t testutil.TB, totalSamples, totalSeries int) {
-	tmpDir, err := ioutil.TempDir("", "testorbench-testtsdbseries")
-	testutil.Ok(t, err)
-	t.Cleanup(func() {
-		testutil.Ok(t, os.RemoveAll(tmpDir))
-	})
+	tmpDir := t.TempDir()
 
 	// This means 3 blocks and the head.
 	const numOfBlocks = 4
@@ -566,11 +530,8 @@ func benchTSDBStoreSeries(t testutil.TB, totalSamples, totalSeries int) {
 			resps[j] = append(resps[j], storepb.NewSeriesResponse(created[i]))
 		}
 
-		_ = createBlockFromHead(t, tmpDir, head)
-		t.Cleanup(func() {
-			testutil.Ok(t, head.Close())
-		})
-
+		_ = storetestutil.CreateBlockFromHead(t, tmpDir, head)
+		testutil.Ok(t, head.Close())
 	}
 
 	head2, created := storetestutil.CreateHeadWithSeries(t, 3, storetestutil.HeadGenOptions{
@@ -580,15 +541,13 @@ func benchTSDBStoreSeries(t testutil.TB, totalSamples, totalSeries int) {
 		WithWAL:          true,
 		Random:           random,
 	})
-	t.Cleanup(func() {
-		testutil.Ok(t, head2.Close())
-	})
+	testutil.Ok(t, head2.Close())
 
 	for i := 0; i < len(created); i++ {
 		resps[3] = append(resps[3], storepb.NewSeriesResponse(created[i]))
 	}
 
-	db, err := tsdb.OpenDBReadOnly(tmpDir, logger)
+	db, err := tsdb.OpenDBReadOnly(tmpDir, "", logger)
 	testutil.Ok(t, err)
 
 	defer func() { testutil.Ok(t, db.Close()) }()
@@ -602,7 +561,7 @@ func benchTSDBStoreSeries(t testutil.TB, totalSamples, totalSeries int) {
 			// Add external labels & frame it.
 			s := r.GetSeries()
 			bytesLeftForChunks := store.maxBytesPerFrame
-			lbls := make([]labelpb.ZLabel, 0, len(s.Labels)+len(extLabels))
+			lbls := make([]labelpb.ZLabel, 0, len(s.Labels)+extLabels.Len())
 			for _, l := range s.Labels {
 				lbls = append(lbls, labelpb.ZLabel{
 					Name:  l.Name,
@@ -610,13 +569,13 @@ func benchTSDBStoreSeries(t testutil.TB, totalSamples, totalSeries int) {
 				})
 				bytesLeftForChunks -= lbls[len(lbls)-1].Size()
 			}
-			for _, l := range extLabels {
+			extLabels.Range(func(l labels.Label) {
 				lbls = append(lbls, labelpb.ZLabel{
 					Name:  l.Name,
 					Value: l.Value,
 				})
 				bytesLeftForChunks -= lbls[len(lbls)-1].Size()
-			}
+			})
 			sort.Slice(lbls, func(i, j int) bool {
 				return lbls[i].Name < lbls[j].Name
 			})

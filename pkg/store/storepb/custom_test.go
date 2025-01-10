@@ -8,14 +8,16 @@ import (
 	"path/filepath"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/model/labels"
-	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 
+	"github.com/efficientgo/core/testutil"
+
+	"github.com/thanos-io/thanos/pkg/extpromql"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
-	"github.com/thanos-io/thanos/pkg/testutil"
 )
 
 type sample struct {
@@ -71,7 +73,7 @@ func (s *listSeriesSet) Next() bool {
 
 func (s *listSeriesSet) At() (labels.Labels, []AggrChunk) {
 	if s.idx < 0 || s.idx >= len(s.series) {
-		return nil, nil
+		return labels.EmptyLabels(), nil
 	}
 
 	return s.series[s.idx].PromLabels(), s.series[s.idx].Chunks
@@ -83,7 +85,7 @@ type errSeriesSet struct{ err error }
 
 func (errSeriesSet) Next() bool { return false }
 
-func (errSeriesSet) At() (labels.Labels, []AggrChunk) { return nil, nil }
+func (errSeriesSet) At() (labels.Labels, []AggrChunk) { return labels.EmptyLabels(), nil }
 
 func (e errSeriesSet) Err() error { return e.err }
 
@@ -255,10 +257,10 @@ func TestMergeSeriesSets(t *testing.T) {
 
 			expected: []rawSeries{
 				{
-					lset:   labels.Labels{labels.Label{Name: "a", Value: "a"}},
+					lset:   labels.FromStrings("a", "a"),
 					chunks: [][]sample{{{t: 1, v: 1}, {t: 2, v: 2}}, {{t: 3, v: 3}, {t: 4, v: 4}}},
 				}, {
-					lset: labels.Labels{labels.Label{Name: "a", Value: "c"}},
+					lset: labels.FromStrings("a", "c"),
 					chunks: [][]sample{
 						{{t: 1, v: 1}, {t: 2, v: 2}, {t: 3, v: 3}, {t: 4, v: 4}},
 						{{t: 11, v: 11}, {t: 12, v: 12}, {t: 13, v: 13}, {t: 14, v: 14}},
@@ -268,7 +270,7 @@ func TestMergeSeriesSets(t *testing.T) {
 						{{t: 20, v: 20}, {t: 21, v: 21}, {t: 22, v: 23}, {t: 24, v: 24}},
 					},
 				}, {
-					lset:   labels.Labels{labels.Label{Name: "a", Value: "d"}},
+					lset:   labels.FromStrings("a", "d"),
 					chunks: [][]sample{{{t: 11, v: 1}, {t: 12, v: 2}}, {{t: 13, v: 3}, {t: 14, v: 4}}},
 				},
 			},
@@ -313,7 +315,7 @@ func TestMergeSeriesSets(t *testing.T) {
 
 			expected: []rawSeries{
 				{
-					lset: labels.Labels{labels.Label{Name: "a", Value: "c"}},
+					lset: labels.FromStrings("a", "c"),
 					chunks: [][]sample{
 						{{t: 11, v: 11}, {t: 12, v: 12}, {t: 13, v: 13}, {t: 14, v: 14}},
 						{{t: 1, v: 1}, {t: 2, v: 2}, {t: 3, v: 3}, {t: 4, v: 4}},
@@ -368,7 +370,7 @@ func expandSeriesSet(t *testing.T, gotSS SeriesSet) (ret []rawSeries) {
 			testutil.Ok(t, err)
 
 			iter := c.Iterator(nil)
-			for iter.Next() {
+			for iter.Next() != chunkenc.ValNone {
 				t, v := iter.At()
 				r.chunks[i] = append(r.chunks[i], sample{t: t, v: v})
 			}
@@ -519,10 +521,154 @@ func TestMatchersToString_Translate(t *testing.T) {
 			testutil.Equals(t, c.expected, MatchersToString(ms...))
 
 			// Is this parsable?
-			promMsParsed, err := parser.ParseMetricSelector(c.expected)
-			testutil.Ok(t, err)
-			testutil.Equals(t, promMs, promMsParsed)
+			promMsParsed, err := extpromql.ParseMetricSelector(c.expected)
+			testutil.Ok(t, err, "unexpected error parsing %q", c.expected)
+			testutil.Assert(t, len(promMs) == len(promMsParsed))
+			for i := 0; i < len(promMs); i++ {
+				testutil.Equals(t, promMs[i].String(), promMsParsed[i].String())
+			}
 		})
 
+	}
+}
+
+func TestSeriesRequestToPromQL(t *testing.T) {
+	ts := []struct {
+		name     string
+		r        *SeriesRequest
+		expected string
+	}{
+		{
+			name: "Single matcher regular expression",
+			r: &SeriesRequest{
+				Matchers: []LabelMatcher{
+					{
+						Type:  LabelMatcher_RE,
+						Name:  "namespace",
+						Value: "kube-.+",
+					},
+				},
+				QueryHints: &QueryHints{
+					Func: &Func{
+						Name: "max",
+					},
+				},
+			},
+			expected: `max ({namespace=~"kube-.+"})`,
+		},
+		{
+			name: "Single matcher regular expression with grouping",
+			r: &SeriesRequest{
+				Matchers: []LabelMatcher{
+					{
+						Type:  LabelMatcher_RE,
+						Name:  "namespace",
+						Value: "kube-.+",
+					},
+				},
+				QueryHints: &QueryHints{
+					Func: &Func{
+						Name: "max",
+					},
+					Grouping: &Grouping{
+						By:     false,
+						Labels: []string{"container", "pod"},
+					},
+				},
+			},
+			expected: `max without (container,pod) ({namespace=~"kube-.+"})`,
+		},
+		{
+			name: "Multiple matchers with grouping",
+			r: &SeriesRequest{
+				Matchers: []LabelMatcher{
+					{
+						Type:  LabelMatcher_EQ,
+						Name:  "__name__",
+						Value: "kube_pod_info",
+					},
+					{
+						Type:  LabelMatcher_RE,
+						Name:  "namespace",
+						Value: "kube-.+",
+					},
+				},
+				QueryHints: &QueryHints{
+					Func: &Func{
+						Name: "max",
+					},
+					Grouping: &Grouping{
+						By:     false,
+						Labels: []string{"container", "pod"},
+					},
+				},
+			},
+			expected: `max without (container,pod) ({__name__="kube_pod_info", namespace=~"kube-.+"})`,
+		},
+		{
+			name: "Query with vector range selector",
+			r: &SeriesRequest{
+				Matchers: []LabelMatcher{
+					{
+						Type:  LabelMatcher_EQ,
+						Name:  "__name__",
+						Value: "kube_pod_info",
+					},
+					{
+						Type:  LabelMatcher_RE,
+						Name:  "namespace",
+						Value: "kube-.+",
+					},
+				},
+				QueryHints: &QueryHints{
+					Func: &Func{
+						Name: "max_over_time",
+					},
+					Range: &Range{
+						Millis: 10 * time.Minute.Milliseconds(),
+					},
+				},
+			},
+			expected: `max_over_time ({__name__="kube_pod_info", namespace=~"kube-.+"}[600000ms])`,
+		},
+		{
+			name: "Query with grouping and vector range selector",
+			r: &SeriesRequest{
+				Matchers: []LabelMatcher{
+					{
+						Type:  LabelMatcher_EQ,
+						Name:  "__name__",
+						Value: "kube_pod_info",
+					},
+					{
+						Type:  LabelMatcher_RE,
+						Name:  "namespace",
+						Value: "kube-.+",
+					},
+				},
+				QueryHints: &QueryHints{
+					Func: &Func{
+						Name: "max",
+					},
+					Grouping: &Grouping{
+						By:     false,
+						Labels: []string{"container", "pod"},
+					},
+					Range: &Range{
+						Millis: 10 * time.Minute.Milliseconds(),
+					},
+				},
+			},
+			expected: `max without (container,pod) ({__name__="kube_pod_info", namespace=~"kube-.+"}[600000ms])`,
+		},
+	}
+
+	for _, tc := range ts {
+		t.Run(tc.name, func(t *testing.T) {
+			actual := tc.r.ToPromQL()
+			if tc.expected != actual {
+				t.Fatalf("invalid promql result, got %s, want %s", actual, tc.expected)
+			}
+		})
 	}
 }

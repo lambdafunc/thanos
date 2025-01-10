@@ -34,17 +34,21 @@ See [release process docs](release-process.md) for details.
 
 ## Building from source:
 
-Thanos is built purely in [Golang](https://golang.org/), thus allowing to run Thanos on various x64 operating systems.
+Thanos is built purely in [Golang](https://go.dev/), thus allowing to run Thanos on various x64 operating systems.
 
-If you want to build Thanos from source you would need a working installation of the Go 1.16+ [toolchain](https://github.com/golang/tools) (`GOPATH`, `PATH=${GOPATH}/bin:${PATH}`).
+Thanos can **not** be downloaded nor installed via the `go get` or `go install` methods. Starting in Go 1.17, installing executables with `go get` is deprecated. `go install` may be used instead. However, in order to avoid ambiguity, when go install is used with a version suffix, all arguments must refer to main packages in the same module at the same version. If that module has a `go.mod` file, it must not contain directives like *replace* or *exclude* that would cause it to be interpreted differently if it were the main module.
 
-Thanos can be downloaded and built by running:
+Thanos uses the directive *replace*. The reason is to provide a way to unblock ourselves promptly while also being flexible in the packages that we (re)use. Support for `go install` is not likely at this point.
 
-```bash
-go get github.com/thanos-io/thanos/cmd/thanos
+If you want to build Thanos from source you would need a working installation of the Go 1.18+ [toolchain](https://github.com/golang/tools) (`GOPATH`, `PATH=${GOPATH}/bin:${PATH}`). Next one should make a clone of our repository:
+
+```
+git clone git@github.com:thanos-io/thanos.git
 ```
 
-The `thanos` binary should now be in your `$PATH` and is the only thing required to deploy any of its components.
+When you have access to the source code locally, we have prepared a `Makefile`. Invoke this by using `make` in your CLI. For example `make help` will list all options. For building Thanos one could use `make build`
+
+The `thanos` binary should now be in your project folder and is the only thing required to deploy any of its components.
 
 ## Contributing
 
@@ -75,7 +79,7 @@ If you want to add yourself to this list, let us know!
 
 ## Deploying Thanos
 
-* [WIP] Detailed, free, in-browser interactive tutorial [as Katacoda Thanos Course](https://katacoda.com/thanos/courses/thanos/1-globalview)
+* Detailed, free, in-browser interactive tutorial [as Killercoda Thanos Course](https://killercoda.com/thanos/)
 * [Quick Tutorial](quick-tutorial.md) on Thanos website.
 
 ## Operating
@@ -84,38 +88,86 @@ See up to date [jsonnet mixins](https://github.com/thanos-io/thanos/tree/main/mi
 
 ## Talks
 
-* 12.2020: [Absorbing Thanos Infinite Powers for Multi-Cluster Telemetry](https://www.youtube.com/watch?v=6Nx2BFyr7qQ)
-* 12.2020: [Turn It Up to a Million: Ingesting Millions of Metrics with Thanos Receive](https://www.youtube.com/watch?v=5MJqdJq41Ms)
-* 02.2018: [Very first Prometheus Meetup Slides](https://www.slideshare.net/BartomiejPotka/thanos-global-durable-prometheus-monitoring)
-* 02.2019: [FOSDEM + demo](https://fosdem.org/2019/schedule/event/thanos_transforming_prometheus_to_a_global_scale_in_a_seven_simple_steps/)
-* 03.2019: [Alibaba Cloud user story](https://www.youtube.com/watch?v=ZS6zMksfipc)
-* 09.2019: [CloudNative Warsaw Slides](https://docs.google.com/presentation/d/1cKpbJY3jIAtr03M-zcNujwBA38_LDj7NqE4LjNfvglE/edit?usp=sharing)
-* 11.2019: [CloudNative Deep Dive](https://www.youtube.com/watch?v=qQN0N14HXPM)
-* 11.2019: [CloudNative Intro](https://www.youtube.com/watch?v=m0JgWlTc60Q)
-* 2019: [Prometheus in Practice: HA with Thanos](https://www.slideshare.net/ThomasRiley45/prometheus-in-practice-high-availability-with-thanos-devopsdays-edinburgh-2019)
+* 2024
+  * [Enlightning - Scaling Your Metrics with Thanos](https://www.youtube.com/live/1qvcVJiVx7M)
+  * [6 Learnings from Building Thanos Project](https://www.youtube.com/watch?v=ur8dDFaNEFg)
+  * [Monitoring the World: Scaling Thanos in Dynamic Prometheus Environments](https://www.youtube.com/watch?v=ofhvbG0iTjU)
+  * [Scaling Thanos at Reddit](https://www.youtube.com/watch?v=c18RGbAxCfI)
+  * [Thanos Project Updates](https://www.youtube.com/watch?v=wmNtCj5D4_A)
+  * [Connecting Thanos to the Outer Rim via Query API](https://www.youtube.com/watch?v=E8L8fuRj66o)
+  * [Multiverse of Thanos: Making Thanos Multi-Tenanted](https://www.youtube.com/watch?v=SAyPQ2d8v4Q)
+  * [Thanos Receiver Deep Dive](https://www.youtube.com/watch?v=jn_zIfBuUyE)
+  * [From UI to Storage: Unraveling the Magic of Thanos Query Processing](https://www.youtube.com/watch?v=ZGQIitaKoTM)
+  * [Thanos’ Infinity Stones and How You Can Operate Them!](https://www.youtube.com/watch?v=e8kvX6mRlyE)
+
+* 2023
+  * [Planetscale monitoring: Handling billions of active series with Prometheus and Thanos](https://www.youtube.com/watch?v=Or8r46fSaOg)
+  * [Taming the Tsunami: low latency ingestion of push-based metrics in Prometheus](https://www.youtube.com/watch?v=W81x1j765hc)
+
+* 2022
+  * [Story of Correlation: Integrating Thanos Metrics with Observability Signals](https://www.youtube.com/watch?v=rWFb01GW0mQ)
+  * [Running the Observability As a Service For Your Teams With Thanos](https://www.youtube.com/watch?v=I4Mfyfd_4M8)
+  * [Monitoring multiple Kubernetes Clusters with Thanos](https://www.youtube.com/watch?v=V4v-c0VeqLw)
+  * [Thanos: Scaling Prometheus 101](https://www.youtube.com/watch?v=iN6DR28gAyQ)
+  * [MaaS for the Masses: Build Your Monitoring-as-a-Service Solution With Prometheus](https://www.youtube.com/watch?v=EFPPic9dBS4)
+
+* 2021
+  * [Adopting Thanos gradually across all of LastPass infrastructures](https://www.youtube.com/watch?v=Ddq8m04594A)
+  * [Using Thanos to gain a unified way to query over multiple clusters](https://www.youtube.com/watch?v=yefffBLuVh0)
+  * [Thanos: Easier Than Ever to Scale Prometheus and Make It Highly Available](https://www.youtube.com/watch?v=mtwwUqeIHAw)
+
+* 2020
+  * [Absorbing Thanos Infinite Powers for Multi-Cluster Telemetry](https://www.youtube.com/watch?v=6Nx2BFyr7qQ)
+  * [Turn It Up to a Million: Ingesting Millions of Metrics with Thanos Receive](https://www.youtube.com/watch?v=5MJqdJq41Ms)
+  * [Thanos: Cheap, Simple and Scalable Prometheus](https://www.youtube.com/watch?v=Wroo1n5GWwg)
+  * [Thanos: Prometheus at Scale!](https://www.youtube.com/watch?v=q9j8vpgFkoY)
+  * [Introduction to Thanos](https://www.youtube.com/watch?v=j4TAGO019HU)
+  * [Using Thanos as a long term storage for your Prometheus metrics](https://www.youtube.com/watch?v=cedzqLgRgaM)
+
+* 2019
+  * [FOSDEM + demo](https://fosdem.org/2019/schedule/event/thanos_transforming_prometheus_to_a_global_scale_in_a_seven_simple_steps/)
+  * [Alibaba Cloud user story](https://www.youtube.com/watch?v=ZS6zMksfipc)
+  * [CloudNative Warsaw Slides](https://docs.google.com/presentation/d/1cKpbJY3jIAtr03M-zcNujwBA38_LDj7NqE4LjNfvglE/edit?usp=sharing)
+  * [CloudNative Deep Dive](https://www.youtube.com/watch?v=qQN0N14HXPM)
+  * [CloudNative Intro](https://www.youtube.com/watch?v=m0JgWlTc60Q)
+  * [Prometheus in Practice: HA with Thanos](https://www.slideshare.net/ThomasRiley45/prometheus-in-practice-high-availability-with-thanos-devopsdays-edinburgh-2019)
+
+* 2018
+  * [Very first Prometheus Meetup Slides](https://www.slideshare.net/BartomiejPotka/thanos-global-durable-prometheus-monitoring)
 
 ## Blog posts
 
-* 2020:
+* 2024:
+  * [Scaling Prometheus with Thanos.](https://www.cloudraft.io/blog/scaling-prometheus-with-thanos)
+  * [Streamlining Long-Term Storage Query Performance for Metrics With Thanos.](https://blog.devops.dev/streamlining-long-term-storage-query-performance-for-metrics-with-thanos-b44419c70cc4)
 
-  * [Banzai Cloud user story](https://banzaicloud.com/blog/multi-cluster-monitoring/)
+* 2023:
+  * [Thanos Ruler and Prometheus Rules — a match made in heaven.](https://medium.com/@helia.barroso/thanos-ruler-and-prometheus-rules-a-match-made-in-heaven-a4f08f2399ac)
+
+* 2022:
+  * [Thanos at Medallia: A Hybrid Architecture Scaled to Support 1 Billion+ Series Across 40+ Data Centers](https://thanos.io/blog/2022-09-08-thanos-at-medallia/)
+  * [Deploy Thanos Receive with native OCI Object Storage on Oracle Kubernetes Engine](https://medium.com/@lmukadam/deploy-thanos-receive-with-native-oci-object-storage-on-kubernetes-829326ea0bc6)
+  * [Leveraging Consul for Thanos Query Discovery](https://nicolastakashi.medium.com/leveraging-consul-for-thanos-query-discovery-34212d496c88)
+
+* 2021:
+  * [Adopting Thanos at LastPass](https://krisztianfekete.org/adopting-thanos-at-lastpass/)
+
+* 2020:
+  * [Banzai Cloud user story](https://outshift.cisco.com/blog/multi-cluster-monitoring)
   * [Monitoring the Beat microservices: A tale of evolution](https://build.thebeat.co/monitoring-the-beat-microservices-a-tale-of-evolution-4e246882606e)
 
 * 2019:
-
   * [Metric monitoring architecture](https://improbable.io/blog/thanos-architecture-at-improbable)
   * [Red Hat user story](https://blog.openshift.com/federated-prometheus-with-thanos-receive/)
   * [HelloFresh blog posts part 1](https://engineering.hellofresh.com/monitoring-at-hellofresh-part-1-architecture-677b4bd6b728)
   * [HelloFresh blog posts part 2](https://engineering.hellofresh.com/monitoring-at-hellofresh-part-2-operating-the-monitoring-system-8175cd939c1d)
   * [Thanos deployment](https://www.metricfire.com/blog/ha-kubernetes-monitoring-using-prometheus-and-thanos)
-  * [Taboola user story](https://engineering.taboola.com/monitoring-and-metering-scale/)
+  * [Taboola user story](https://blog.taboola.com/monitoring-and-metering-scale/)
   * [Thanos via Prometheus Operator](https://kkc.github.io/2019/02/10/prometheus-operator-with-thanos/)
 
 * 2018:
-
-  * [Introduction blog post](https://improbable.io/games/blog/thanos-prometheus-at-scale)
+  * [Introduction blog post](https://improbable.io/blog/thanos-prometheus-at-scale)
   * [Monzo user story](https://monzo.com/blog/2018/07/27/how-we-monitor-monzo)
-  * [Banzai Cloud hand's on](https://banzaicloud.com/blog/hands-on-thanos/)
   * [uSwitch user story](https://medium.com/uswitch-labs/making-prometheus-more-awesome-with-thanos-fbec8c6c28ad)
   * [Thanos usage](https://www.infracloud.io/blogs/thanos-ha-scalable-prometheus/)
 
