@@ -8,6 +8,7 @@ import (
 	"sort"
 
 	"github.com/pkg/errors"
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/relabel"
 	"github.com/prometheus/prometheus/storage"
@@ -16,6 +17,7 @@ import (
 	"github.com/prometheus/prometheus/tsdb/chunks"
 	"github.com/prometheus/prometheus/tsdb/index"
 	"github.com/prometheus/prometheus/tsdb/tombstones"
+	"github.com/prometheus/prometheus/util/annotations"
 
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 )
@@ -82,7 +84,7 @@ SeriesLoop:
 			}
 
 			// Special case: Delete whole series.
-			chksIter := s.Iterator()
+			chksIter := s.Iterator(nil)
 			var chks []chunks.Meta
 			for chksIter.Next() {
 				chks = append(chks, chksIter.At())
@@ -102,8 +104,8 @@ SeriesLoop:
 
 		d.curr = &storage.ChunkSeriesEntry{
 			Lset: lbls,
-			ChunkIteratorFn: func() chunks.Iterator {
-				return NewDelGenericSeriesIterator(s.Iterator(), intervals, func(intervals tombstones.Intervals) {
+			ChunkIteratorFn: func(it chunks.Iterator) chunks.Iterator {
+				return NewDelGenericSeriesIterator(s.Iterator(it), intervals, func(intervals tombstones.Intervals) {
 					d.log.DeleteSeries(lbls, intervals)
 				}).ToChunkSeriesIterator()
 			},
@@ -145,7 +147,7 @@ func (d *delModifierSeriesSet) Err() error {
 	return d.ChunkSeriesSet.Err()
 }
 
-func (d *delModifierSeriesSet) Warnings() storage.Warnings {
+func (d *delModifierSeriesSet) Warnings() annotations.Annotations {
 	return d.ChunkSeriesSet.Warnings()
 }
 
@@ -234,9 +236,13 @@ type delSeriesIterator struct {
 	curr chunkenc.Iterator
 }
 
-func (p *delSeriesIterator) Next() bool {
-	if p.curr != nil && p.curr.Next() {
-		return true
+func (p *delSeriesIterator) Next() chunkenc.ValueType {
+	if p.curr == nil {
+		return chunkenc.ValNone
+	}
+
+	if valueType := p.curr.Next(); valueType != chunkenc.ValNone {
+		return valueType
 	}
 
 	for p.next() {
@@ -245,26 +251,44 @@ func (p *delSeriesIterator) Next() bool {
 		} else {
 			p.curr = p.currChkMeta.Chunk.Iterator(nil)
 		}
-		if p.curr.Next() {
-			return true
+		if valueType := p.curr.Next(); valueType != chunkenc.ValNone {
+			return valueType
 		}
 	}
-	return false
+	return chunkenc.ValNone
 }
 
-func (p *delSeriesIterator) Seek(t int64) bool {
-	if p.curr != nil && p.curr.Seek(t) {
-		return true
+func (p *delSeriesIterator) Seek(t int64) chunkenc.ValueType {
+	if p.curr == nil {
+		return chunkenc.ValNone
 	}
-	for p.Next() {
-		if p.curr.Seek(t) {
-			return true
+
+	if valueType := p.curr.Seek(t); valueType != chunkenc.ValNone {
+		return valueType
+	}
+	for p.Next() != chunkenc.ValNone {
+		if valueType := p.curr.Seek(t); valueType != chunkenc.ValNone {
+			return valueType
 		}
 	}
-	return false
+	return chunkenc.ValNone
 }
 
 func (p *delSeriesIterator) At() (int64, float64) { return p.curr.At() }
+
+// TODO(rabenhorst): Needs to be implemented for native histogram support.
+func (p *delSeriesIterator) AtHistogram(*histogram.Histogram) (int64, *histogram.Histogram) {
+	panic("not implemented")
+}
+
+func (p *delSeriesIterator) AtFloatHistogram(*histogram.FloatHistogram) (int64, *histogram.FloatHistogram) {
+	panic("not implemented")
+}
+
+func (p *delSeriesIterator) AtT() int64 {
+	t, _ := p.curr.At()
+	return t
+}
 
 func (p *delSeriesIterator) Err() error {
 	if err := p.delGenericSeriesIterator.Err(); err != nil {
@@ -300,7 +324,7 @@ func (p *delChunkSeriesIterator) Next() bool {
 		return false
 	}
 
-	if !p.currDelIter.Next() {
+	if p.currDelIter.Next() == chunkenc.ValNone {
 		if err := p.currDelIter.Err(); err != nil {
 			p.err = errors.Wrap(err, "iterate chunk while re-encoding")
 			return false
@@ -315,7 +339,7 @@ func (p *delChunkSeriesIterator) Next() bool {
 	p.curr.MinTime = t
 	app.Append(t, v)
 
-	for p.currDelIter.Next() {
+	for p.currDelIter.Next() != chunkenc.ValNone {
 		t, v = p.currDelIter.At()
 		app.Append(t, v)
 	}
@@ -347,9 +371,11 @@ func (d *RelabelModifier) Modify(_ index.StringIter, set storage.ChunkSeriesSet,
 	for set.Next() {
 		s := set.At()
 		lbls := s.Labels()
-		chksIter := s.Iterator()
+		chksIter := s.Iterator(nil)
 
-		if processedLabels := relabel.Process(lbls, d.relabels...); len(processedLabels) == 0 {
+		// The labels have to be copied because `relabel.Process` is now overwriting the original
+		// labels to same memory. This happens since Prometheus v2.39.0.
+		if processedLabels, _ := relabel.Process(lbls.Copy(), d.relabels...); processedLabels.IsEmpty() {
 			// Special case: Delete whole series if no labels are present.
 			var (
 				minT int64 = math.MaxInt64
@@ -377,10 +403,10 @@ func (d *RelabelModifier) Modify(_ index.StringIter, set storage.ChunkSeriesSet,
 			log.DeleteSeries(lbls, deleted)
 			p.SeriesProcessed()
 		} else {
-			for _, lb := range processedLabels {
-				symbols[lb.Name] = struct{}{}
-				symbols[lb.Value] = struct{}{}
-			}
+			processedLabels.Range(func(l labels.Label) {
+				symbols[l.Name] = struct{}{}
+				symbols[l.Value] = struct{}{}
+			})
 
 			lbStr := processedLabels.String()
 			if _, ok := chunkSeriesMap[lbStr]; !ok {
@@ -436,7 +462,7 @@ func newChunkSeriesBuilder(lset labels.Labels) *mergeChunkSeries {
 
 func (s *mergeChunkSeries) addIter(iter chunkenc.Iterator) {
 	s.ss = append(s.ss, &storage.SeriesEntry{
-		SampleIteratorFn: func() chunkenc.Iterator {
+		SampleIteratorFn: func(iterator chunkenc.Iterator) chunkenc.Iterator {
 			return iter
 		},
 	})
@@ -446,15 +472,15 @@ func (s *mergeChunkSeries) Labels() labels.Labels {
 	return s.lset
 }
 
-func (s *mergeChunkSeries) Iterator() chunks.Iterator {
+func (s *mergeChunkSeries) Iterator(iterator chunks.Iterator) chunks.Iterator {
 	if len(s.ss) == 0 {
 		return nil
 	}
 	if len(s.ss) == 1 {
-		return storage.NewSeriesToChunkEncoder(s.ss[0]).Iterator()
+		return storage.NewSeriesToChunkEncoder(s.ss[0]).Iterator(iterator)
 	}
 
-	return storage.NewSeriesToChunkEncoder(storage.ChainedSeriesMerge(s.ss...)).Iterator()
+	return storage.NewSeriesToChunkEncoder(storage.ChainedSeriesMerge(s.ss...)).Iterator(iterator)
 }
 
 type errorOnlyStringIter struct {
@@ -479,6 +505,6 @@ func (s *listChunkSeriesSet) Next() bool {
 	return s.idx < len(s.css)
 }
 
-func (s *listChunkSeriesSet) At() storage.ChunkSeries    { return s.css[s.idx] }
-func (s *listChunkSeriesSet) Err() error                 { return nil }
-func (s *listChunkSeriesSet) Warnings() storage.Warnings { return nil }
+func (s *listChunkSeriesSet) At() storage.ChunkSeries           { return s.css[s.idx] }
+func (s *listChunkSeriesSet) Err() error                        { return nil }
+func (s *listChunkSeriesSet) Warnings() annotations.Annotations { return nil }

@@ -4,11 +4,12 @@
 package main
 
 import (
+	"os"
 	"testing"
 
 	"github.com/go-kit/log"
 
-	"github.com/thanos-io/thanos/pkg/testutil"
+	"github.com/efficientgo/core/testutil"
 )
 
 func Test_CheckRules(t *testing.T) {
@@ -44,4 +45,11 @@ func Test_CheckRules_Glob(t *testing.T) {
 	// invalid path
 	files = &[]string{"./testdata/rules-files/*.yamlaaa"}
 	testutil.NotOk(t, checkRulesFiles(logger, files), "expected err for file %s", files)
+
+	// Unreadble path
+	files = &[]string{"./testdata/rules-files/unreadable_valid.yaml"}
+	filename := (*files)[0]
+	testutil.Ok(t, os.Chmod(filename, 0000), "failed to change file permissions of %s to 0000", filename)
+	testutil.NotOk(t, checkRulesFiles(logger, files), "expected err for file %s", files)
+	testutil.Ok(t, os.Chmod(filename, 0777), "failed to change file permissions of %s to 0777", filename)
 }

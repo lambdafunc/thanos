@@ -4,16 +4,18 @@
 package rules
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/go-kit/log"
 	"github.com/prometheus/prometheus/model/labels"
 
+	"github.com/efficientgo/core/testutil"
 	"github.com/thanos-io/thanos/pkg/promclient"
-	"github.com/thanos-io/thanos/pkg/testutil"
 	"github.com/thanos-io/thanos/pkg/testutil/e2eutil"
 )
 
@@ -35,7 +37,7 @@ rule_files:
   - %s/examples/alerts/alerts.yaml
   - %s/examples/alerts/rules.yaml
 `, root, root))
-	testutil.Ok(t, p.Start())
+	testutil.Ok(t, p.Start(context.Background(), log.NewNopLogger()))
 
 	u, err := url.Parse(fmt.Sprintf("http://%s", p.Addr()))
 	testutil.Ok(t, err)
@@ -43,5 +45,5 @@ rule_files:
 	promRules := NewPrometheus(u, promclient.NewDefaultClient(), func() labels.Labels {
 		return labels.FromStrings("replica", "test1")
 	})
-	testRulesAgainstExamples(t, filepath.Join(root, "examples/alerts"), promRules)
+	testRulesAgainstExamples(t, filepath.Join(root, "examples/alerts"), promRules, true)
 }

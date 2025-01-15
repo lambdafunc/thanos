@@ -7,19 +7,21 @@ import (
 	"strings"
 	"time"
 
-	cortexcache "github.com/cortexproject/cortex/pkg/chunk/cache"
-	"github.com/cortexproject/cortex/pkg/frontend/transport"
-	"github.com/cortexproject/cortex/pkg/querier/queryrange"
-	cortexvalidation "github.com/cortexproject/cortex/pkg/util/validation"
+	extflag "github.com/efficientgo/tools/extkingpin"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/pkg/errors"
+	prommodel "github.com/prometheus/common/model"
 	"gopkg.in/yaml.v2"
 
-	extflag "github.com/efficientgo/tools/extkingpin"
-	prommodel "github.com/prometheus/common/model"
-
+	cortexcache "github.com/thanos-io/thanos/internal/cortex/chunk/cache"
+	"github.com/thanos-io/thanos/internal/cortex/frontend/transport"
+	"github.com/thanos-io/thanos/internal/cortex/querier"
+	"github.com/thanos-io/thanos/internal/cortex/querier/queryrange"
+	"github.com/thanos-io/thanos/internal/cortex/util/flagext"
+	cortexvalidation "github.com/thanos-io/thanos/internal/cortex/util/validation"
 	"github.com/thanos-io/thanos/pkg/cacheutil"
+	"github.com/thanos-io/thanos/pkg/exthttp"
 	"github.com/thanos-io/thanos/pkg/model"
 )
 
@@ -28,6 +30,7 @@ type ResponseCacheProvider string
 const (
 	INMEMORY  ResponseCacheProvider = "IN-MEMORY"
 	MEMCACHED ResponseCacheProvider = "MEMCACHED"
+	REDIS     ResponseCacheProvider = "REDIS"
 )
 
 var (
@@ -42,6 +45,11 @@ var (
 			MaxItemSize:               model.Bytes(1024 * 1024),
 			DNSProviderUpdateInterval: 10 * time.Second,
 		},
+		Expiration: 24 * time.Hour,
+	}
+	// DefaultRedisConfig is default redis config for queryfrontend.
+	DefaultRedisConfig = RedisResponseCacheConfig{
+		Redis:      cacheutil.DefaultRedisClientConfig,
 		Expiration: 24 * time.Hour,
 	}
 )
@@ -59,6 +67,13 @@ type InMemoryResponseCacheConfig struct {
 // MemcachedResponseCacheConfig holds the configs for the memcache cache provider.
 type MemcachedResponseCacheConfig struct {
 	Memcached cacheutil.MemcachedClientConfig `yaml:",inline"`
+	// Expiration sets a global expiration limit for all cached items.
+	Expiration time.Duration `yaml:"expiration"`
+}
+
+// RedisResponseCacheConfig holds the configs for the redis cache provider.
+type RedisResponseCacheConfig struct {
+	Redis cacheutil.RedisClientConfig `yaml:",inline"`
 	// Expiration sets a global expiration limit for all cached items.
 	Expiration time.Duration `yaml:"expiration"`
 }
@@ -127,12 +142,39 @@ func NewCacheConfig(logger log.Logger, confContentYaml []byte) (*cortexcache.Con
 				Timeout:        config.Memcached.Timeout,
 				MaxIdleConns:   config.Memcached.MaxIdleConnections,
 				Addresses:      strings.Join(config.Memcached.Addresses, ","),
+				AutoDiscovery:  config.Memcached.AutoDiscovery,
 				UpdateInterval: config.Memcached.DNSProviderUpdateInterval,
 				MaxItemSize:    int(config.Memcached.MaxItemSize),
 			},
 			Background: cortexcache.BackgroundConfig{
 				WriteBackBuffer:     config.Memcached.MaxAsyncBufferSize,
 				WriteBackGoroutines: config.Memcached.MaxAsyncConcurrency,
+			},
+		}, nil
+	case string(REDIS):
+		config := DefaultRedisConfig
+		if err := yaml.UnmarshalStrict(backendConfig, &config); err != nil {
+			return nil, err
+		}
+		if config.Expiration <= 0 {
+			level.Warn(logger).Log("msg", "redis cache valid time set to 0, so using a default of 24 hours expiration time")
+			config.Expiration = 24 * time.Hour
+		}
+		return &cortexcache.Config{
+			Redis: cortexcache.RedisConfig{
+				Endpoint:           config.Redis.Addr,
+				Timeout:            config.Redis.ReadTimeout,
+				MasterName:         config.Redis.MasterName,
+				Expiration:         config.Expiration,
+				DB:                 config.Redis.DB,
+				Password:           flagext.Secret{Value: config.Redis.Password},
+				Username:           config.Redis.Username,
+				EnableTLS:          config.Redis.TLSEnabled,
+				InsecureSkipVerify: config.Redis.TLSConfig.InsecureSkipVerify,
+			},
+			Background: cortexcache.BackgroundConfig{
+				WriteBackBuffer:     config.Redis.MaxSetMultiConcurrency * config.Redis.SetMultiBatchSize,
+				WriteBackGoroutines: config.Redis.MaxSetMultiConcurrency,
 			},
 		}, nil
 	default:
@@ -149,6 +191,7 @@ type DownstreamTripperConfig struct {
 	MaxIdleConns          *int               `yaml:"max_idle_conns"`
 	MaxIdleConnsPerHost   *int               `yaml:"max_idle_conns_per_host"`
 	MaxConnsPerHost       *int               `yaml:"max_conns_per_host"`
+	TLSConfig             *exthttp.TLSConfig `yaml:"tls_config"`
 
 	CachePathOrContent extflag.PathOrContent
 }
@@ -164,6 +207,12 @@ type Config struct {
 	CacheCompression       string
 	RequestLoggingDecision string
 	DownstreamURL          string
+	ForwardHeaders         []string
+	NumShards              int
+	TenantHeader           string
+	DefaultTenant          string
+	TenantCertField        string
+	EnableXFunctions       bool
 }
 
 // QueryRangeConfig holds the config for query range tripperware.
@@ -178,6 +227,9 @@ type QueryRangeConfig struct {
 	AlignRangeWithStep     bool
 	RequestDownsampled     bool
 	SplitQueriesByInterval time.Duration
+	MinQuerySplitInterval  time.Duration
+	MaxQuerySplitInterval  time.Duration
+	HorizontalShards       int64
 	MaxRetries             int
 	Limits                 *cortexvalidation.Limits
 }
@@ -201,11 +253,27 @@ type LabelsConfig struct {
 // Validate a fully initialized config.
 func (cfg *Config) Validate() error {
 	if cfg.QueryRangeConfig.ResultsCacheConfig != nil {
-		if cfg.QueryRangeConfig.SplitQueriesByInterval <= 0 {
-			return errors.New("split queries interval should be greater than 0 when caching is enabled")
+		if cfg.QueryRangeConfig.SplitQueriesByInterval <= 0 && !cfg.isDynamicSplitSet() {
+			return errors.New("split queries or split threshold interval should be greater than 0 when caching is enabled")
 		}
-		if err := cfg.QueryRangeConfig.ResultsCacheConfig.Validate(); err != nil {
+		// This is instantiated just to make the QFE config comply with validation against the Cortex Querier,
+		// but in Thanos we don't use this configuration at all.
+		ignoredQueryConfig := querier.Config{
+			EnablePerStepStats: cfg.QueryRangeConfig.ResultsCacheConfig.CacheQueryableSamplesStats,
+		}
+		if err := cfg.QueryRangeConfig.ResultsCacheConfig.Validate(ignoredQueryConfig); err != nil {
 			return errors.Wrap(err, "invalid ResultsCache config for query_range tripperware")
+		}
+	}
+
+	if cfg.isDynamicSplitSet() && cfg.isStaticSplitSet() {
+		return errors.New("split queries interval and dynamic query split interval cannot be set at the same time")
+	}
+
+	if cfg.isDynamicSplitSet() {
+
+		if err := cfg.validateDynamicSplitParams(); err != nil {
+			return err
 		}
 	}
 
@@ -213,7 +281,7 @@ func (cfg *Config) Validate() error {
 		if cfg.LabelsConfig.SplitQueriesByInterval <= 0 {
 			return errors.New("split queries interval should be greater than 0  when caching is enabled")
 		}
-		if err := cfg.LabelsConfig.ResultsCacheConfig.Validate(); err != nil {
+		if err := cfg.LabelsConfig.ResultsCacheConfig.Validate(querier.Config{}); err != nil {
 			return errors.Wrap(err, "invalid ResultsCache config for labels tripperware")
 		}
 	}
@@ -227,4 +295,29 @@ func (cfg *Config) Validate() error {
 	}
 
 	return nil
+}
+
+func (cfg *Config) validateDynamicSplitParams() error {
+	if cfg.QueryRangeConfig.HorizontalShards <= 0 {
+		return errors.New("min horizontal shards should be greater than 0 when query split threshold is enabled")
+	}
+
+	if cfg.QueryRangeConfig.MaxQuerySplitInterval <= 0 {
+		return errors.New("max query split interval should be greater than 0 when query split threshold is enabled")
+	}
+
+	if cfg.QueryRangeConfig.MinQuerySplitInterval <= 0 {
+		return errors.New("min query split interval should be greater than 0 when query split threshold is enabled")
+	}
+	return nil
+}
+
+func (cfg *Config) isStaticSplitSet() bool {
+	return cfg.QueryRangeConfig.SplitQueriesByInterval != 0
+}
+
+func (cfg *Config) isDynamicSplitSet() bool {
+	return cfg.QueryRangeConfig.MinQuerySplitInterval > 0 ||
+		cfg.QueryRangeConfig.HorizontalShards > 0 ||
+		cfg.QueryRangeConfig.MaxQuerySplitInterval > 0
 }

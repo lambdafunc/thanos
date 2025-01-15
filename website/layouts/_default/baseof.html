@@ -47,10 +47,16 @@
                     </div>
                 </li>
                 <li class="nav-item">
+                    <a class="nav-link" href="/support">Support and Training</a>
+                </li>
+                <li class="nav-item">
                     <a class="nav-link" href="https://github.com/{{ .Site.Params.GithubUser }}/{{ .Site.Params.GithubProject }}/releases">Releases</a>
                 </li>
                 <li class="nav-item">
                     {{ partial "versioning/version-picker.html" . }}
+                </li>
+                <li class="nav-item">
+                   <a class="nav-link" href="/blog">Blog</a>
                 </li>
                 <li class="nav-item">
                     <a href="https://github.com/{{ .Site.Params.GithubUser }}/{{ .Site.Params.GithubProject }}" class="nav-link"><i class="fab fa-fw fa-github"></i> GitHub</a>
@@ -64,7 +70,7 @@
     {{ block "main" . }}{{ end }}
     <footer class="bg-dark text-light">
         <div class="container text-center text-md-left">
-            <div class="row py-5">
+            <div class="row py-5 footer-container">
                 <div class="col-12 col-md-6 col-lg mb-3 mb-lg-0">
                     <img src="{{ "icon-dark.png" | relURL }}" alt="Thanos" width="45%">
                 </div>
@@ -87,7 +93,7 @@
                         <li><a href="https://twitter.com/{{ .Site.Params.TwitterHandle }}" class="text-reset"><i class="fab fa-fw fa-twitter"></i> Twitter</a></li>
                     </ul>
                 </div>
-                <div class="col col-md-6 col-lg">
+                <div class="col col-md-6 col-lg about-section">
                     <h6 class="font-weight-bold">About</h6>
                     <p>Thanos is an OSS licensed project as Apache License 2.0</p>
                     <p>Founded by <a href="https://improbable.io" class="text-reset">Improbable ❤️</a></p>

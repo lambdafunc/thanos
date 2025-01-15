@@ -6,9 +6,11 @@ package tls
 import (
 	"crypto/tls"
 	"crypto/x509"
-	"io/ioutil"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,8 +20,8 @@ import (
 )
 
 // NewServerConfig provides new server TLS configuration.
-func NewServerConfig(logger log.Logger, cert, key, clientCA string) (*tls.Config, error) {
-	if key == "" && cert == "" {
+func NewServerConfig(logger log.Logger, certPath, keyPath, clientCA, tlsMinVersion string) (*tls.Config, error) {
+	if keyPath == "" && certPath == "" {
 		if clientCA != "" {
 			return nil, errors.New("when a client CA is used a server key and certificate must also be provided")
 		}
@@ -30,23 +32,34 @@ func NewServerConfig(logger log.Logger, cert, key, clientCA string) (*tls.Config
 
 	level.Info(logger).Log("msg", "enabling server side TLS")
 
-	if key == "" || cert == "" {
+	if keyPath == "" || certPath == "" {
 		return nil, errors.New("both server key and certificate must be provided")
 	}
 
+	minTlsVersion, err := getTlsVersion(tlsMinVersion)
+	if err != nil {
+		return nil, err
+	}
+
 	tlsCfg := &tls.Config{
-		MinVersion: tls.VersionTLS12,
+		MinVersion: minTlsVersion,
+	}
+	// Certificate is loaded during server startup to check for any errors.
+	certificate, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		return nil, errors.Wrap(err, "server credentials")
 	}
 
 	mngr := &serverTLSManager{
-		srvCertPath: cert,
-		srvKeyPath:  key,
+		srvCertPath: certPath,
+		srvKeyPath:  keyPath,
+		srvCert:     &certificate,
 	}
 
 	tlsCfg.GetCertificate = mngr.getCertificate
 
 	if clientCA != "" {
-		caPEM, err := ioutil.ReadFile(filepath.Clean(clientCA))
+		caPEM, err := os.ReadFile(filepath.Clean(clientCA))
 		if err != nil {
 			return nil, errors.Wrap(err, "reading client CA")
 		}
@@ -103,7 +116,7 @@ func (m *serverTLSManager) getCertificate(clientHello *tls.ClientHelloInfo) (*tl
 func NewClientConfig(logger log.Logger, cert, key, caCert, serverName string, skipVerify bool) (*tls.Config, error) {
 	var certPool *x509.CertPool
 	if caCert != "" {
-		caPEM, err := ioutil.ReadFile(filepath.Clean(caCert))
+		caPEM, err := os.ReadFile(filepath.Clean(caCert))
 		if err != nil {
 			return nil, errors.Wrap(err, "reading client CA")
 		}
@@ -184,4 +197,36 @@ func (m *clientTLSManager) getClientCertificate(*tls.CertificateRequestInfo) (*t
 	}
 
 	return m.cert, nil
+}
+
+type validOption struct {
+	tlsOption map[string]uint16
+}
+
+func (validOption validOption) joinString() string {
+	var keys []string
+
+	for key := range validOption.tlsOption {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, ", ")
+}
+
+func getTlsVersion(tlsMinVersion string) (uint16, error) {
+
+	validOption := validOption{
+		tlsOption: map[string]uint16{
+			"1.0": tls.VersionTLS10,
+			"1.1": tls.VersionTLS11,
+			"1.2": tls.VersionTLS12,
+			"1.3": tls.VersionTLS13,
+		},
+	}
+
+	if _, ok := validOption.tlsOption[tlsMinVersion]; !ok {
+		return 0, errors.New(fmt.Sprintf("invalid TLS version: %s, valid values are %s", tlsMinVersion, validOption.joinString()))
+	}
+
+	return validOption.tlsOption[tlsMinVersion], nil
 }

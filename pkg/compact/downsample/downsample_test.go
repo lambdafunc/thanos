@@ -4,7 +4,7 @@
 package downsample
 
 import (
-	"io/ioutil"
+	"context"
 	"math"
 	"os"
 	"path/filepath"
@@ -13,6 +13,7 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/pkg/errors"
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/value"
 	"github.com/prometheus/prometheus/storage"
@@ -22,15 +23,697 @@ import (
 	"github.com/prometheus/prometheus/tsdb/index"
 	"github.com/prometheus/prometheus/tsdb/tombstones"
 	"github.com/prometheus/prometheus/tsdb/tsdbutil"
-	"go.uber.org/goleak"
+
+	"github.com/efficientgo/core/testutil"
 
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
-	"github.com/thanos-io/thanos/pkg/testutil"
+	"github.com/thanos-io/thanos/pkg/testutil/custom"
+	"github.com/thanos-io/thanos/pkg/testutil/testiters"
 )
 
 func TestMain(m *testing.M) {
-	goleak.VerifyTestMain(m)
+	custom.TolerantVerifyLeakMain(m)
+}
+
+func TestDownsampleAndReadResultingData(t *testing.T) {
+	data := []sample{
+		{t: 1688526018213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688526078213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688526138213, v: math.Float64frombits(4607156757263679111)},
+		{t: 1688526198213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688526258213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688526318213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688526438213, v: math.Float64frombits(4607105434191002523)},
+		{t: 1688526498213, v: math.Float64frombits(4607143926495509974)},
+		{t: 1688526558213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688526618213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688526678213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688526738213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688526798213, v: math.Float64frombits(4607131022513257114)},
+		{t: 1688526858213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688526918213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688526978213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688527038213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688527098213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688527158213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688527218213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688527278213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688527338213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688527398213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688527458213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688527518213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688527578213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688527638213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688527698213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688527758213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688527818213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688527878213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688527938213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688527998213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688528058213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688528118213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688528178213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688528238213, v: math.Float64frombits(4607092603422833380)},
+		{t: 1688528298213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688528358213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688528418213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688528478213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688528538213, v: math.Float64frombits(4607118264959171663)},
+		{t: 1688528598213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688528658213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688528718213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688528778213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688528838213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688528898213, v: math.Float64frombits(4607131022513257122)},
+		{t: 1688528958213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688529018213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688529078213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688529138213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688529198213, v: math.Float64frombits(4607118264959171672)},
+		{t: 1688529258213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688529318213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688529378213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688529438213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688529498213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688529558213, v: math.Float64frombits(4607169588031848265)},
+		{t: 1688529618213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688529678213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688529738213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688529798213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688529858213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688529918213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688529978213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688530038213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688530098213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688530158213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688530218213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688530278213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688530338213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688530398213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688530458213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688530518213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688530578213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688530638213, v: math.Float64frombits(4607143926495509973)},
+		{t: 1688530698213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688530758213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688530818213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688530878213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688530938213, v: math.Float64frombits(4607118264959171663)},
+		{t: 1688530998213, v: math.Float64frombits(4607143926495509974)},
+		{t: 1688531058213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688531118213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688531178213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688531238213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688531298213, v: math.Float64frombits(4607156757263679111)},
+		{t: 1688531358213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688531418213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688531478213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688531538213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688531598213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688531718213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688531778213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688531838213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688531898213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688531958213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688532018213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688532078213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688532198213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688532258213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688532318213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688532378213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688532438213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688532498213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688532558213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688532618213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688532678213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688532738213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688532798213, v: math.Float64frombits(4607143871584947194)},
+		{t: 1688532858213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688532918213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688532978213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688533038213, v: math.Float64frombits(4607143871584947189)},
+		{t: 1688533098213, v: math.Float64frombits(4607131022513257122)},
+		{t: 1688533158213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688533218213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688533278213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688533338213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688533398213, v: math.Float64frombits(4607143926495509968)},
+		{t: 1688533458213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688533518213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688533578213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688533638213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688533698213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688533758213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688533818213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688533878213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688533938213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688533998213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688534058213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688534118213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688534178213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688534238213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688534298213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688534358213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688534418213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688534478213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688534538213, v: math.Float64frombits(4607131022513257117)},
+		{t: 1688534598213, v: math.Float64frombits(4607156720656637259)},
+		{t: 1688534658213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688534718213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688534778213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688534838213, v: math.Float64frombits(4607105214234976770)},
+		{t: 1688534898213, v: math.Float64frombits(4607156720656637259)},
+		{t: 1688534958213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688535018213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688535078213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688535138213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688535198213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688535258213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688535318213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688535378213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688535438213, v: math.Float64frombits(4607131095727340818)},
+		{t: 1688535498213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688535558213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688535618213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688535678213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688535738213, v: math.Float64frombits(4607156720656637259)},
+		{t: 1688535798213, v: math.Float64frombits(4607143926495509973)},
+		{t: 1688535858213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688535918213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688535978213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688536038213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688536098213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688536158213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688536218213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688536278213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688536338213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688536398213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688536458213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688536518213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688536578213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688536638213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688536698213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688536758213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688536818213, v: math.Float64frombits(4607169588031848266)},
+		{t: 1688536878213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688536938213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688536998213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688537058213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688537118213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688537178213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688537238213, v: math.Float64frombits(4607131095727340818)},
+		{t: 1688537298213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688537358213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688537418213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688537478213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688537538213, v: math.Float64frombits(4607079772654664231)},
+		{t: 1688537598213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688537658213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688537718213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688537838213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688537898213, v: math.Float64frombits(4607079772654664232)},
+		{t: 1688537958213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688538018213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688538078213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688538138213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688538198213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688538258213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688538318213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688538378213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688538438213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688538498213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688538558213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688538618213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688538678213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688538738213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688538798213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688538858213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688538918213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688538978213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688539038213, v: math.Float64frombits(4607118173441567050)},
+		{t: 1688539098213, v: math.Float64frombits(4607131022513257121)},
+		{t: 1688539158213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688539218213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688539278213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688539338213, v: math.Float64frombits(4607143871584947195)},
+		{t: 1688539398213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688539458213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688539518213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688539578213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688539638213, v: math.Float64frombits(4607105434191002518)},
+		{t: 1688539758213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688539818213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688539878213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688539938213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688539998213, v: math.Float64frombits(4607118264959171665)},
+		{t: 1688540058213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688540118213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688540178213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688540238213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688540298213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688540358213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688540418213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688540478213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688540538213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688540598213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688540658213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688540718213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688540778213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688540838213, v: math.Float64frombits(4607002531796356391)},
+		{t: 1688540898213, v: math.Float64frombits(4607066611952456451)},
+		{t: 1688540958213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688541018213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688541078213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688541138213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688541198213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688541258213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688541318213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688541378213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688541438213, v: math.Float64frombits(4607066777154806746)},
+		{t: 1688541498213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688541558213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688541618213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688541678213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688541738213, v: math.Float64frombits(4607015618813818502)},
+		{t: 1688541798213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688541858213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688541918213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688541978213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688542038213, v: math.Float64frombits(4607079772654664233)},
+		{t: 1688542098213, v: math.Float64frombits(4607054111118325940)},
+		{t: 1688542158213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688542218213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688542278213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688542338213, v: math.Float64frombits(4607105434191002523)},
+		{t: 1688542398213, v: math.Float64frombits(4607053928083116679)},
+		{t: 1688542458213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688542518213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688542578213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688542638213, v: math.Float64frombits(4607066777154806748)},
+		{t: 1688542698213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688542758213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688542818213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688542878213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688542938213, v: math.Float64frombits(4607118173441567034)},
+		{t: 1688542998213, v: math.Float64frombits(4607143871584947194)},
+		{t: 1688543058213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688543118213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688543178213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688543238213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688543298213, v: math.Float64frombits(4607131022513257122)},
+		{t: 1688543358213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688543418213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688543478213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688543538213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688543598213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688543658213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688543718213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688543778213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688543838213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688543898213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688543958213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688544018213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688544078213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688544138213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688544198213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688544258213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688544318213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688544378213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688544438213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688544498213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688544558213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688544618213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688544678213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688544738213, v: math.Float64frombits(4607092346807469995)},
+		{t: 1688544798213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688544858213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688544918213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688544978213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688545038213, v: math.Float64frombits(4607066777154806751)},
+		{t: 1688545098213, v: math.Float64frombits(4607066941886495085)},
+		{t: 1688545158213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688545218213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688545278213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688545338213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688545398213, v: math.Float64frombits(4607143926495509968)},
+		{t: 1688545458213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688545518213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688545578213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688545638213, v: math.Float64frombits(4607079772654664233)},
+		{t: 1688545698213, v: math.Float64frombits(4607105434191002519)},
+		{t: 1688545758213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688545818213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688545878213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688545938213, v: math.Float64frombits(4607092731182971622)},
+		{t: 1688545998213, v: math.Float64frombits(4607118356216413265)},
+		{t: 1688546058213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688546118213, v: math.Float64frombits(4607169606283296587)},
+		{t: 1688546178213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688546238213, v: math.Float64frombits(4607054293632809142)},
+		{t: 1688546298213, v: math.Float64frombits(4607054293632809140)},
+		{t: 1688546358213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688546418213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688546478213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688546538213, v: math.Float64frombits(4607067106149529966)},
+		{t: 1688546598213, v: math.Float64frombits(4607079918666250791)},
+		{t: 1688546658213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688546718213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688546778213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688546838213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688546898213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688546958213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688547018213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688547078213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688547138213, v: math.Float64frombits(4607092731182971626)},
+		{t: 1688547198213, v: math.Float64frombits(4607092731182971619)},
+		{t: 1688547258213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688547318213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688547378213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688547438213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688547498213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688547558213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688547618213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688547678213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688547738213, v: math.Float64frombits(4607156793766575752)},
+		{t: 1688547798213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688547858213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688547918213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688547978213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688548098213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688548158213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688548218213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688548278213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688548338213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688548398213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688548458213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688548518213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688548578213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688548638213, v: math.Float64frombits(4607105434191002521)},
+		{t: 1688548698213, v: math.Float64frombits(4607054111118325939)},
+		{t: 1688548758213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688548818213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688548878213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688548938213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688548998213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688549058213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688549118213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688549178213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688549238213, v: math.Float64frombits(4607118356216413266)},
+		{t: 1688549298213, v: math.Float64frombits(4607118356216413266)},
+		{t: 1688549358213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688549418213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688549478213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688549538213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688549598213, v: math.Float64frombits(4607092731182971623)},
+		{t: 1688549658213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688549718213, v: math.Float64frombits(4607169606283296583)},
+		{t: 1688549778213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688549838213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688549898213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688549958213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688550018213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688550078213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688550138213, v: math.Float64frombits(4607156793766575752)},
+		{t: 1688550198213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688550258213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688550318213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688550438213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688550498213, v: math.Float64frombits(4607080064263031713)},
+		{t: 1688550558213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688550618213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688550678213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688550738213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688550798213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688550858213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688550918213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688550978213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688551038213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688551098213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688551158213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688551218213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688551278213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688551338213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688551398213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688551458213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688551518213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688551578213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688551638213, v: math.Float64frombits(4607067269945908499)},
+		{t: 1688551698213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688551758213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688551818213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688551878213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688551938213, v: math.Float64frombits(4607118447214401342)},
+		{t: 1688551998213, v: math.Float64frombits(4607092858580154923)},
+		{t: 1688552058213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688552118213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688552178213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688552238213, v: math.Float64frombits(4607105652897278138)},
+		{t: 1688552298213, v: math.Float64frombits(4607105652897278140)},
+		{t: 1688552358213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688552418213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688552478213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688552538213, v: math.Float64frombits(4607080064263031714)},
+		{t: 1688552598213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688552658213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688552718213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688552778213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688552838213, v: math.Float64frombits(4607028886994538873)},
+		{t: 1688552898213, v: math.Float64frombits(4607092858580154926)},
+		{t: 1688552958213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688553018213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688553078213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688553138213, v: math.Float64frombits(4607118447214401341)},
+		{t: 1688553198213, v: math.Float64frombits(4607080064263031710)},
+		{t: 1688553258213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688553318213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688553378213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688553438213, v: math.Float64frombits(4607067269945908500)},
+		{t: 1688553498213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688553558213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688553618213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688553678213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688553738213, v: math.Float64frombits(4607092985615927779)},
+		{t: 1688553798213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688553858213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688553918213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688553978213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688554038213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688554098213, v: math.Float64frombits(4607105761785083446)},
+		{t: 1688554158213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688554218213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688554278213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688554338213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688554458213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688554518213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688554578213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688554638213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688554698213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688554758213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688554818213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688554878213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688554998213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688555058213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688555118213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688555298213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688555358213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688555418213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688555478213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688555538213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688555598213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688555658213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688555718213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688555778213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688555838213, v: math.Float64frombits(4607067269945908499)},
+		{t: 1688555898213, v: math.Float64frombits(4607041681311662081)},
+		{t: 1688555958213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688556018213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688556078213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688556138213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688556198213, v: math.Float64frombits(4607067269945908504)},
+		{t: 1688556258213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688556318213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688556378213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688556438213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688556498213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688556558213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688556618213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688556678213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688556738213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688556798213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688556858213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688556918213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688556978213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688557038213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688557098213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688557158213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688557218213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688557278213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688557338213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688557398213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688557458213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688557518213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688557578213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688557638213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688557698213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688557758213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688557818213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688557878213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688557938213, v: math.Float64frombits(4607092603422833381)},
+		{t: 1688557998213, v: math.Float64frombits(4607079918666250794)},
+		{t: 1688558058213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688558118213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688558178213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688558238213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688558298213, v: math.Float64frombits(4607092475298186899)},
+		{t: 1688558358213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688558418213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688558478213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688558538213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688558598213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688558658213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688558718213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688558778213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688558838213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688558898213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688558958213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688559018213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688559138213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688559198213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688559258213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688559318213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688559378213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688559438213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688559498213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688559558213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688559618213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688559678213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688559738213, v: math.Float64frombits(4607105543699692438)},
+		{t: 1688559798213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688559858213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688559918213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688559978213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688560038213, v: math.Float64frombits(4607054293632809136)},
+		{t: 1688560098213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688560158213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688560218213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688560278213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688560338213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688560398213, v: math.Float64frombits(4607092731182971621)},
+		{t: 1688560458213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688560518213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688560578213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688560638213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688560698213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688560758213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688560818213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688560878213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688560938213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688560998213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688561058213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688561118213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688561178213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688561238213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688561298213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688561358213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688561418213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688561478213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688561538213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688561598213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688561658213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688561718213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688561778213, v: math.Float64frombits(4607182418800017408)},
+		{t: 1688561838213, v: math.Float64frombits(4607092731182971626)},
+		{t: 1688561898213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688561958213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688562018213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688562078213, v: math.Float64frombits(value.NormalNaN)},
+		{t: 1688562138213, v: math.Float64frombits(4607028449581987651)},
+		{t: 1688562198213, v: math.Float64frombits(4607028668599367493)},
+		{t: 1688562258213, v: math.Float64frombits(value.NormalNaN)},
+	}
+
+	var (
+		reuseIt    chunkenc.Iterator
+		all        []sample
+		aggrChunks []*AggrChunk
+	)
+
+	// downsample from raw to 300s
+	chks := DownsampleRaw(data, ResLevel1)
+	testutil.Assert(t, chks != nil, "Downsample from raw to 300s")
+
+	for _, c := range chks {
+		ac, ok := c.Chunk.(*AggrChunk)
+		if !ok {
+			if c.Chunk.NumSamples() == 0 {
+				continue
+			} else {
+				testutil.Ok(t, expandChunkIterator(c.Chunk.Iterator(reuseIt), &all), "expand chunk %d", c.Ref)
+				aggrDataChunks := DownsampleRaw(all, ResLevel1)
+				for _, cn := range aggrDataChunks {
+					ac, ok = cn.Chunk.(*AggrChunk)
+					testutil.Assert(t, ok, "Not able to convert non-empty XOR chunks to 5m downsampled aggregated chunks.")
+				}
+			}
+		}
+		aggrChunks = append(aggrChunks, ac)
+	}
+
+	// validate aggrChunks from first downsample iteration
+	validateAggrChunks(t, aggrChunks, chks, "First downsample iteration")
+
+	// downsample from 300s to 3600s
+	downsampledChunks, err := downsampleAggr(
+		aggrChunks,
+		&all,
+		chks[0].MinTime,
+		chks[len(chks)-1].MaxTime,
+		ResLevel1,
+		ResLevel2,
+	)
+	testutil.Ok(t, err, "Downsample from 300s to 3600s")
+	testutil.Assert(t, downsampledChunks != nil)
+
+	aggrChunks = aggrChunks[:0]
+	for _, c := range downsampledChunks {
+		ac, ok := c.Chunk.(*AggrChunk)
+		if !ok {
+			if c.Chunk.NumSamples() == 0 {
+				continue
+			} else {
+				t.Fatalf("expected downsampled chunk (*downsample.AggrChunk) got a non-empty %T instead", c.Chunk)
+			}
+		}
+		aggrChunks = append(aggrChunks, ac)
+	}
+
+	// validate arrgChunks from second downsample iteration
+	validateAggrChunks(t, aggrChunks, chks, "Second downsample iteration")
+}
+
+func validateAggrChunks(t *testing.T, aggrChunks []*AggrChunk, chks []chunks.Meta, d string) {
+	for j, c := range aggrChunks {
+		var iters [2]chunkenc.Iterator
+		// we need only 0th and 1st AggrType for alignment check,
+		// but we iterate through all 5 to catch error "invalid size"
+		for i := 0; i < 5; i++ {
+			ac, err := c.Get(AggrType(i))
+			testutil.Ok(t, err, "%s. Get AggrType(%d) from aggrChunk #%d. MinT %d, MaxT %d", d, i, j, chks[j].MinTime, chks[j].MaxTime)
+			if i < 2 {
+				iters[i] = ac.Iterator(nil)
+			}
+		}
+
+		// create iterator to check samples
+		ai := NewAverageChunkIterator(iters[0], iters[1])
+		// exhaust iterator and...
+		for ai.Next() != chunkenc.ValNone {
+		}
+		// ...check its error
+		err := ai.Err()
+		testutil.Ok(t, err, d)
+	}
 }
 
 func TestDownsampleCounterBoundaryReset(t *testing.T) {
@@ -49,7 +732,7 @@ func TestDownsampleCounterBoundaryReset(t *testing.T) {
 			testutil.Ok(t, err)
 
 			iter := chk.Iterator(nil)
-			for iter.Next() {
+			for iter.Next() != chunkenc.ValNone {
 				t, v := iter.At()
 				res = append(res, sample{t, v})
 			}
@@ -66,7 +749,7 @@ func TestDownsampleCounterBoundaryReset(t *testing.T) {
 		}
 
 		citer := NewApplyCounterResetsIterator(iters...)
-		for citer.Next() {
+		for citer.Next() != chunkenc.ValNone {
 			t, v := citer.At()
 			res = append(res, sample{t: t, v: v})
 		}
@@ -281,6 +964,25 @@ func TestDownsample(t *testing.T) {
 
 			expected: realisticChkDataWithCounterResetRes5m,
 		},
+		{
+			name: "three chunks, the first one with NaN values only",
+			inRaw: [][]sample{
+				{{20, math.Float64frombits(value.NormalNaN)}, {40, math.Float64frombits(value.NormalNaN)}, {60, math.Float64frombits(value.NormalNaN)}, {80, math.Float64frombits(value.NormalNaN)}, {100, math.NaN()}, {101, math.Float64frombits(value.StaleNaN)}, {120, math.Float64frombits(value.NormalNaN)}, {180, math.Float64frombits(value.NormalNaN)}, {250, math.Float64frombits(value.NormalNaN)}},
+				{{260, 1}, {300, 10}, {340, 15}, {380, 25}, {420, 35}},
+				{{460, math.Float64frombits(value.StaleNaN)}, {500, 10}, {540, 3}},
+			},
+			resolution: 100,
+
+			expected: []map[AggrType][]sample{
+				{
+					AggrCount:   {{t: 299, v: 1}, {t: 399, v: 3}, {t: 499, v: 1}, {t: 540, v: 2}},
+					AggrSum:     {{t: 299, v: 1}, {t: 399, v: 50}, {t: 499, v: 35}, {t: 540, v: 13}},
+					AggrMin:     {{t: 299, v: 1}, {t: 399, v: 10}, {t: 499, v: 35}, {t: 540, v: 3}},
+					AggrMax:     {{t: 299, v: 1}, {t: 399, v: 25}, {t: 499, v: 35}, {t: 540, v: 10}},
+					AggrCounter: {{t: 260, v: 1}, {t: 299, v: 1}, {t: 399, v: 25}, {t: 499, v: 35}, {t: 540, v: 48}, {t: 540, v: 3}},
+				},
+			},
+		},
 		// Aggregated -> Downsampled Aggregated.
 		{
 			name: "single aggregated chunks",
@@ -433,9 +1135,8 @@ func TestDownsample(t *testing.T) {
 		t.Run(tcase.name, func(t *testing.T) {
 			logger := log.NewLogfmtLogger(os.Stderr)
 
-			dir, err := ioutil.TempDir("", "downsample-raw")
-			testutil.Ok(t, err)
-			defer func() { testutil.Ok(t, os.RemoveAll(dir)) }()
+			dir := t.TempDir()
+			ctx := context.Background()
 
 			// Ideally we would use tsdb.HeadBlock here for less dependency on our own code. However,
 			// it cannot accept the counter signal sample with the same timestamp as the previous sample.
@@ -448,7 +1149,7 @@ func TestDownsample(t *testing.T) {
 				fakeMeta.Thanos.Downsample.Resolution = tcase.resolution - 1
 			}
 
-			id, err := Downsample(logger, fakeMeta, mb, dir, tcase.resolution)
+			id, err := Downsample(ctx, logger, fakeMeta, mb, dir, tcase.resolution)
 			if tcase.expectedDownsamplingErr != nil {
 				testutil.NotOk(t, err)
 				testutil.Equals(t, tcase.expectedDownsamplingErr(ser.chunks).Error(), err.Error())
@@ -467,7 +1168,8 @@ func TestDownsample(t *testing.T) {
 			testutil.Ok(t, err)
 			defer func() { testutil.Ok(t, chunkr.Close()) }()
 
-			pall, err := indexr.Postings(index.AllPostingsKey())
+			key, values := index.AllPostingsKey()
+			pall, err := indexr.Postings(ctx, key, values)
 			testutil.Ok(t, err)
 
 			var series []storage.SeriesRef
@@ -477,14 +1179,18 @@ func TestDownsample(t *testing.T) {
 			testutil.Ok(t, pall.Err())
 			testutil.Equals(t, 1, len(series))
 
+			var builder labels.ScratchBuilder
 			var lset labels.Labels
 			var chks []chunks.Meta
-			testutil.Ok(t, indexr.Series(series[0], &lset, &chks))
+			testutil.Ok(t, indexr.Series(series[0], &builder, &chks))
+
+			lset = builder.Labels()
 			testutil.Equals(t, labels.FromStrings("__name__", "a"), lset)
 
 			var got []map[AggrType][]sample
 			for _, c := range chks {
-				chk, err := chunkr.Chunk(c.Ref)
+				// Ignore iterable as it should be nil.
+				chk, _, err := chunkr.ChunkOrIterable(c)
 				testutil.Ok(t, err)
 
 				m := map[AggrType][]sample{}
@@ -504,6 +1210,130 @@ func TestDownsample(t *testing.T) {
 			testutil.Equals(t, tcase.expected, got)
 		})
 	}
+}
+
+func TestDownsampleAggrAndEmptyXORChunks(t *testing.T) {
+	logger := log.NewLogfmtLogger(os.Stderr)
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	ser := &series{lset: labels.FromStrings("__name__", "a")}
+	aggr := map[AggrType][]sample{
+		AggrCount:   {{t: 1587690299999, v: 20}, {t: 1587690599999, v: 20}, {t: 1587690899999, v: 20}, {t: 1587691199999, v: 20}, {t: 1587691499999, v: 20}, {t: 1587691799999, v: 20}, {t: 1587692099999, v: 20}, {t: 1587692399999, v: 20}, {t: 1587692699999, v: 16}, {t: 1587692999999, v: 20}, {t: 1587693299999, v: 20}, {t: 1587693590791, v: 20}},
+		AggrSum:     {{t: 1587690299999, v: 9.276972e+06}, {t: 1587690599999, v: 9.359861e+06}, {t: 1587690899999, v: 9.447457e+06}, {t: 1587691199999, v: 9.542732e+06}, {t: 1587691499999, v: 9.630379e+06}, {t: 1587691799999, v: 9.715631e+06}, {t: 1587692099999, v: 9.799808e+06}, {t: 1587692399999, v: 9.888117e+06}, {t: 1587692699999, v: 2.98928e+06}, {t: 1587692999999, v: 81592}, {t: 1587693299999, v: 163711}, {t: 1587693590791, v: 255746}},
+		AggrMin:     {{t: 1587690299999, v: 461968}, {t: 1587690599999, v: 466070}, {t: 1587690899999, v: 470131}, {t: 1587691199999, v: 474913}, {t: 1587691499999, v: 479625}, {t: 1587691799999, v: 483709}, {t: 1587692099999, v: 488036}, {t: 1587692399999, v: 492223}, {t: 1587692699999, v: 75}, {t: 1587692999999, v: 2261}, {t: 1587693299999, v: 6210}, {t: 1587693590791, v: 10464}},
+		AggrMax:     {{t: 1587690299999, v: 465870}, {t: 1587690599999, v: 469951}, {t: 1587690899999, v: 474726}, {t: 1587691199999, v: 479368}, {t: 1587691499999, v: 483566}, {t: 1587691799999, v: 487787}, {t: 1587692099999, v: 492065}, {t: 1587692399999, v: 496245}, {t: 1587692699999, v: 496544}, {t: 1587692999999, v: 6010}, {t: 1587693299999, v: 10242}, {t: 1587693590791, v: 14956}},
+		AggrCounter: {{t: 1587690005791, v: 461968}, {t: 1587690299999, v: 465870}, {t: 1587690599999, v: 469951}, {t: 1587690899999, v: 474726}, {t: 1587691199999, v: 479368}, {t: 1587691499999, v: 483566}, {t: 1587691799999, v: 487787}, {t: 1587692099999, v: 492065}, {t: 1587692399999, v: 496245}, {t: 1587692699999, v: 498647}, {t: 1587692999999, v: 502554}, {t: 1587693299999, v: 506786}, {t: 1587693590791, v: 511500}, {t: 1587693590791, v: 14956}},
+	}
+	raw := chunkenc.NewXORChunk()
+	ser.chunks = append(ser.chunks, encodeTestAggrSeries(aggr), chunks.Meta{
+		MinTime: math.MaxInt64,
+		MaxTime: math.MinInt64,
+		Chunk:   raw,
+	})
+
+	mb := newMemBlock()
+	mb.addSeries(ser)
+
+	fakeMeta := &metadata.Meta{}
+	fakeMeta.Thanos.Downsample.Resolution = 300_000
+	id, err := Downsample(ctx, logger, fakeMeta, mb, dir, 3_600_000)
+	_ = id
+	testutil.Ok(t, err)
+}
+
+func TestDownsampleAggrAndNonEmptyXORChunks(t *testing.T) {
+	logger := log.NewLogfmtLogger(os.Stderr)
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	ser := &series{lset: labels.FromStrings("__name__", "a")}
+	aggr := map[AggrType][]sample{
+		AggrCount:   {{t: 1587690299999, v: 20}, {t: 1587690599999, v: 20}, {t: 1587690899999, v: 20}},
+		AggrSum:     {{t: 1587690299999, v: 9.276972e+06}, {t: 1587690599999, v: 9.359861e+06}, {t: 1587693590791, v: 255746}},
+		AggrMin:     {{t: 1587690299999, v: 461968}, {t: 1587690599999, v: 466070}, {t: 1587690899999, v: 470131}, {t: 1587691199999, v: 474913}},
+		AggrMax:     {{t: 1587690299999, v: 465870}, {t: 1587690599999, v: 469951}, {t: 1587690899999, v: 474726}},
+		AggrCounter: {{t: 1587690005791, v: 461968}, {t: 1587690299999, v: 465870}, {t: 1587690599999, v: 469951}},
+	}
+	raw := chunkenc.NewXORChunk()
+	app, err := raw.Appender()
+	testutil.Ok(t, err)
+
+	app.Append(1587690005794, 42.5)
+
+	ser.chunks = append(ser.chunks, encodeTestAggrSeries(aggr), chunks.Meta{
+		MinTime: math.MaxInt64,
+		MaxTime: math.MinInt64,
+		Chunk:   raw,
+	})
+
+	mb := newMemBlock()
+	mb.addSeries(ser)
+
+	fakeMeta := &metadata.Meta{}
+	fakeMeta.Thanos.Downsample.Resolution = 300_000
+	id, err := Downsample(ctx, logger, fakeMeta, mb, dir, 3_600_000)
+	_ = id
+	testutil.Ok(t, err)
+
+	expected := []map[AggrType][]sample{
+		{
+			AggrCount:   {{1587690005794, 20}, {1587690005794, 20}, {1587690005794, 21}},
+			AggrSum:     {{1587690005794, 9.276972e+06}, {1587690005794, 9.359861e+06}, {1587690005794, 255788.5}},
+			AggrMin:     {{1587690005794, 461968}, {1587690005794, 466070}, {1587690005794, 470131}, {1587690005794, 42.5}},
+			AggrMax:     {{1587690005794, 465870}, {1587690005794, 469951}, {1587690005794, 474726}},
+			AggrCounter: {{1587690005791, 461968}, {1587690599999, 469951}, {1587690599999, 469951}},
+		},
+	}
+
+	_, err = metadata.ReadFromDir(filepath.Join(dir, id.String()))
+	testutil.Ok(t, err)
+
+	indexr, err := index.NewFileReader(filepath.Join(dir, id.String(), block.IndexFilename))
+	testutil.Ok(t, err)
+	defer func() { testutil.Ok(t, indexr.Close()) }()
+
+	chunkr, err := chunks.NewDirReader(filepath.Join(dir, id.String(), block.ChunksDirname), NewPool())
+	testutil.Ok(t, err)
+	defer func() { testutil.Ok(t, chunkr.Close()) }()
+
+	key, values := index.AllPostingsKey()
+	pall, err := indexr.Postings(ctx, key, values)
+	testutil.Ok(t, err)
+
+	var series []storage.SeriesRef
+	for pall.Next() {
+		series = append(series, pall.At())
+	}
+	testutil.Ok(t, pall.Err())
+	testutil.Equals(t, 1, len(series))
+
+	var builder labels.ScratchBuilder
+	var chks []chunks.Meta
+	testutil.Ok(t, indexr.Series(series[0], &builder, &chks))
+
+	var got []map[AggrType][]sample
+	for _, c := range chks {
+		// Ignore iterable as it should be nil.
+		chk, _, err := chunkr.ChunkOrIterable(c)
+		testutil.Ok(t, err)
+
+		m := map[AggrType][]sample{}
+		for _, at := range []AggrType{AggrCount, AggrSum, AggrMin, AggrMax, AggrCounter} {
+			c, err := chk.(*AggrChunk).Get(at)
+			if err == ErrAggrNotExist {
+				continue
+			}
+			testutil.Ok(t, err)
+
+			buf := m[at]
+			testutil.Ok(t, expandChunkIterator(c.Iterator(nil), &buf))
+			m[at] = buf
+		}
+		got = append(got, m)
+	}
+	testutil.Equals(t, expected, got)
+
 }
 
 func chunksToSeriesIteratable(t *testing.T, inRaw [][]sample, inAggr []map[AggrType][]sample) *series {
@@ -560,7 +1390,7 @@ func TestAverageChunkIterator(t *testing.T) {
 	x := NewAverageChunkIterator(newSampleIterator(cnt), newSampleIterator(sum))
 
 	var res []sample
-	for x.Next() {
+	for x.Next() != chunkenc.ValNone {
 		t, v := x.At()
 		res = append(res, sample{t, v})
 	}
@@ -607,7 +1437,7 @@ func TestApplyCounterResetsIterator(t *testing.T) {
 			name: "series with stale marker",
 			chunks: [][]sample{
 				{{100, 10}, {200, 20}, {300, 10}, {400, 20}, {400, 5}},
-				{{500, 10}, {600, 20}, {700, 30}, {800, 40}, {800, 10}},                // No reset, just downsampling addded sample at the end.
+				{{500, 10}, {600, 20}, {700, 30}, {800, 40}, {800, 10}},                // No reset, just downsampling added sample at the end.
 				{{900, 5}, {1000, 10}, {1100, 15}},                                     // Actual reset.
 				{{1200, 20}, {1250, math.Float64frombits(value.StaleNaN)}, {1300, 40}}, // No special last sample, no reset.
 				{{1400, 30}, {1500, 30}, {1600, 50}},                                   // No special last sample, reset.
@@ -661,7 +1491,7 @@ func TestApplyCounterResetsIterator(t *testing.T) {
 			x := NewApplyCounterResetsIterator(its...)
 
 			var res []sample
-			for x.Next() {
+			for x.Next() != chunkenc.ValNone {
 				t, v := x.At()
 				res = append(res, sample{t, v})
 			}
@@ -671,6 +1501,62 @@ func TestApplyCounterResetsIterator(t *testing.T) {
 			for i := range res[1:] {
 				testutil.Assert(t, res[i+1].t >= res[i].t, "sample time %v is not monotonically increasing. previous sample %v is older", res[i+1], res[i])
 				testutil.Assert(t, res[i+1].v >= res[i].v, "sample value %v is not monotonically increasing. previous sample %v is larger", res[i+1], res[i])
+			}
+		})
+	}
+
+}
+
+func TestApplyCounterResetsIteratorHistograms(t *testing.T) {
+	const lenChunks, lenChunk = 4, 10
+
+	histograms := tsdbutil.GenerateTestHistograms(lenChunks * lenChunk)
+
+	var chunks [][]*testiters.HistogramPair
+	for i := 0; i < lenChunks; i++ {
+		var chunk []*testiters.HistogramPair
+		for j := 0; j < lenChunk; j++ {
+			chunk = append(chunk, &testiters.HistogramPair{T: int64(i*lenChunk+j) * 100, H: histograms[i*lenChunk+j]})
+		}
+		chunks = append(chunks, chunk)
+	}
+
+	var expected []*testiters.HistogramPair
+	for i, h := range histograms {
+		expected = append(expected, &testiters.HistogramPair{T: int64(i * 100), H: h})
+	}
+
+	for _, tcase := range []struct {
+		name string
+
+		chunks [][]*testiters.HistogramPair
+
+		expected []*testiters.HistogramPair
+	}{
+		{
+			name:     "histogram series",
+			chunks:   chunks,
+			expected: expected,
+		},
+	} {
+		t.Run(tcase.name, func(t *testing.T) {
+			var its []chunkenc.Iterator
+			for _, c := range tcase.chunks {
+				its = append(its, testiters.NewHistogramIterator(c))
+			}
+
+			x := NewApplyCounterResetsIterator(its...)
+
+			var res []*testiters.HistogramPair
+			for x.Next() != chunkenc.ValNone {
+				t, h := x.AtHistogram(nil)
+				res = append(res, &testiters.HistogramPair{T: t, H: h})
+			}
+			testutil.Ok(t, x.Err())
+			testutil.Equals(t, tcase.expected, res)
+
+			for i := range res[1:] {
+				testutil.Assert(t, res[i+1].T >= res[i].T, "sample time %v is not monotonically increasing. previous sample %v is older", res[i+1], res[i])
 			}
 		})
 	}
@@ -694,15 +1580,14 @@ func TestCounterSeriesIteratorSeek(t *testing.T) {
 	var res []sample
 	x := NewApplyCounterResetsIterator(its...)
 
-	ok := x.Seek(150)
-	testutil.Assert(t, ok, "Seek should return true")
+	valueType := x.Seek(150)
+	testutil.Equals(t, chunkenc.ValFloat, valueType, "Seek should return float value type")
 	testutil.Ok(t, x.Err())
 	for {
 		ts, v := x.At()
 		res = append(res, sample{ts, v})
 
-		ok = x.Next()
-		if !ok {
+		if x.Next() == chunkenc.ValNone {
 			break
 		}
 	}
@@ -721,8 +1606,8 @@ func TestCounterSeriesIteratorSeekExtendTs(t *testing.T) {
 
 	x := NewApplyCounterResetsIterator(its...)
 
-	ok := x.Seek(500)
-	testutil.Assert(t, !ok, "Seek should return false")
+	valueType := x.Seek(500)
+	testutil.Equals(t, chunkenc.ValNone, valueType, "Seek should return none value type")
 }
 
 func TestCounterSeriesIteratorSeekAfterNext(t *testing.T) {
@@ -743,15 +1628,14 @@ func TestCounterSeriesIteratorSeekAfterNext(t *testing.T) {
 
 	x.Next()
 
-	ok := x.Seek(50)
-	testutil.Assert(t, ok, "Seek should return true")
+	valueType := x.Seek(50)
+	testutil.Equals(t, chunkenc.ValFloat, valueType, "Seek should return float value type")
 	testutil.Ok(t, x.Err())
 	for {
 		ts, v := x.At()
 		res = append(res, sample{ts, v})
 
-		ok = x.Next()
-		if !ok {
+		if x.Next() == chunkenc.ValNone {
 			break
 		}
 	}
@@ -762,23 +1646,23 @@ func TestSamplesFromTSDBSamples(t *testing.T) {
 	for _, tcase := range []struct {
 		name string
 
-		input []tsdbutil.Sample
+		input []chunks.Sample
 
 		expected []sample
 	}{
 		{
 			name:     "empty",
-			input:    []tsdbutil.Sample{},
+			input:    []chunks.Sample{},
 			expected: []sample{},
 		},
 		{
 			name:     "one sample",
-			input:    []tsdbutil.Sample{testSample{1, 1}},
+			input:    []chunks.Sample{testSample{1, 1}},
 			expected: []sample{{1, 1}},
 		},
 		{
 			name:     "multiple samples",
-			input:    []tsdbutil.Sample{testSample{1, 1}, testSample{2, 2}, testSample{3, 3}, testSample{4, 4}, testSample{5, 5}},
+			input:    []chunks.Sample{testSample{1, 1}, testSample{2, 2}, testSample{3, 3}, testSample{4, 4}, testSample{5, 5}},
 			expected: []sample{{1, 1}, {2, 2}, {3, 3}, {4, 4}, {5, 5}},
 		},
 	} {
@@ -789,18 +1673,30 @@ func TestSamplesFromTSDBSamples(t *testing.T) {
 	}
 }
 
-// testSample implements tsdbutil.Sample interface.
+// testSample implements chunks.Sample interface.
 type testSample struct {
 	t int64
-	v float64
+	f float64
 }
 
 func (s testSample) T() int64 {
 	return s.t
 }
 
-func (s testSample) V() float64 {
-	return s.v
+func (s testSample) F() float64 {
+	return s.f
+}
+
+func (s testSample) H() *histogram.Histogram {
+	panic("not implemented")
+}
+
+func (s testSample) FH() *histogram.FloatHistogram {
+	panic("not implemented")
+}
+
+func (s testSample) Type() chunkenc.ValueType {
+	panic("not implemented")
 }
 
 type sampleIterator struct {
@@ -816,20 +1712,32 @@ func (it *sampleIterator) Err() error {
 	return nil
 }
 
-func (it *sampleIterator) Next() bool {
+func (it *sampleIterator) Next() chunkenc.ValueType {
 	if it.i >= len(it.l)-1 {
-		return false
+		return chunkenc.ValNone
 	}
 	it.i++
-	return true
+	return chunkenc.ValFloat
 }
 
-func (it *sampleIterator) Seek(int64) bool {
+func (it *sampleIterator) Seek(int64) chunkenc.ValueType {
 	panic("unexpected")
 }
 
 func (it *sampleIterator) At() (t int64, v float64) {
 	return it.l[it.i].t, it.l[it.i].v
+}
+
+func (it *sampleIterator) AtHistogram(*histogram.Histogram) (int64, *histogram.Histogram) {
+	panic("not implemented")
+}
+
+func (it *sampleIterator) AtFloatHistogram(*histogram.FloatHistogram) (int64, *histogram.FloatHistogram) {
+	panic("not implemented")
+}
+
+func (it *sampleIterator) AtT() int64 {
+	return it.l[it.i].t
 }
 
 // memBlock is an in-memory block that implements a subset of the tsdb.BlockReader interface
@@ -900,7 +1808,7 @@ func (b *memBlock) Meta() tsdb.BlockMeta {
 	return tsdb.BlockMeta{}
 }
 
-func (b *memBlock) Postings(name string, val ...string) (index.Postings, error) {
+func (b *memBlock) Postings(_ context.Context, name string, val ...string) (index.Postings, error) {
 	allName, allVal := index.AllPostingsKey()
 
 	if name != allName || val[0] != allVal {
@@ -912,24 +1820,25 @@ func (b *memBlock) Postings(name string, val ...string) (index.Postings, error) 
 	return index.NewListPostings(b.postings), nil
 }
 
-func (b *memBlock) Series(id storage.SeriesRef, lset *labels.Labels, chks *[]chunks.Meta) error {
+func (b *memBlock) Series(id storage.SeriesRef, builder *labels.ScratchBuilder, chks *[]chunks.Meta) error {
 	if int(id) >= len(b.series) {
 		return errors.Wrapf(storage.ErrNotFound, "series with ID %d does not exist", id)
 	}
 	s := b.series[id]
 
-	*lset = append((*lset)[:0], s.lset...)
+	builder.Reset()
+	builder.Assign(s.lset)
 	*chks = append((*chks)[:0], s.chunks...)
 
 	return nil
 }
 
-func (b *memBlock) Chunk(id chunks.ChunkRef) (chunkenc.Chunk, error) {
-	if uint64(id) >= b.numberOfChunks {
-		return nil, errors.Wrapf(storage.ErrNotFound, "chunk with ID %d does not exist", id)
+func (b *memBlock) ChunkOrIterable(m chunks.Meta) (chunkenc.Chunk, chunkenc.Iterable, error) {
+	if uint64(m.Ref) >= b.numberOfChunks {
+		return nil, nil, errors.Wrapf(storage.ErrNotFound, "chunk with ID %d does not exist", m.Ref)
 	}
 
-	return b.chunks[id], nil
+	return b.chunks[m.Ref], nil, nil
 }
 
 func (b *memBlock) Symbols() index.StringIter {

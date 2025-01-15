@@ -1,3 +1,11 @@
+---
+type: proposal
+title: Automated, per-endpoint mTLS
+status: accepted
+owner: Namanl2001
+menu: proposals-accepted
+---
+
 ## Automated, per-endpoint mTLS
 
 * **Owners:**
@@ -73,4 +81,4 @@ While reading the *cert_file* on each handshake we can improve the performance b
 * Implement `--endpoint.config`.
 * Implement gRPC certificate rotation as designed.
 * Add e2e tests for above changes.
-* We would remove the support for seperate CLI options `--secure`, `--cert`, `--key`, `--caCert`, `--serverName` after few releases. As they are already covered in `--endpoint-config`.
+* We would remove the support for separate CLI options `--secure`, `--cert`, `--key`, `--caCert`, `--serverName` after few releases. As they are already covered in `--endpoint-config`.

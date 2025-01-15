@@ -6,28 +6,34 @@ package main
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/alecthomas/units"
+	extflag "github.com/efficientgo/tools/extkingpin"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	grpclogging "github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/logging"
-	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/tags"
 	"github.com/oklog/run"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/common/route"
-
 	commonmodel "github.com/prometheus/common/model"
+	"github.com/prometheus/common/route"
+	"gopkg.in/yaml.v2"
 
-	extflag "github.com/efficientgo/tools/extkingpin"
+	"github.com/thanos-io/objstore"
+	"github.com/thanos-io/objstore/client"
+	objstoretracing "github.com/thanos-io/objstore/tracing/opentracing"
 
 	blocksAPI "github.com/thanos-io/thanos/pkg/api/blocks"
 	"github.com/thanos-io/thanos/pkg/block"
+	"github.com/thanos-io/thanos/pkg/block/indexheader"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/component"
 	hidden "github.com/thanos-io/thanos/pkg/extflag"
+	"github.com/thanos-io/thanos/pkg/exthttp"
 	"github.com/thanos-io/thanos/pkg/extkingpin"
 	"github.com/thanos-io/thanos/pkg/extprom"
 	extpromhttp "github.com/thanos-io/thanos/pkg/extprom/http"
@@ -36,11 +42,11 @@ import (
 	"github.com/thanos-io/thanos/pkg/info/infopb"
 	"github.com/thanos-io/thanos/pkg/logging"
 	"github.com/thanos-io/thanos/pkg/model"
-	"github.com/thanos-io/thanos/pkg/objstore/client"
 	"github.com/thanos-io/thanos/pkg/prober"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	grpcserver "github.com/thanos-io/thanos/pkg/server/grpc"
 	httpserver "github.com/thanos-io/thanos/pkg/server/http"
+	"github.com/thanos-io/thanos/pkg/server/http/middleware"
 	"github.com/thanos-io/thanos/pkg/store"
 	storecache "github.com/thanos-io/thanos/pkg/store/cache"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
@@ -48,41 +54,70 @@ import (
 	"github.com/thanos-io/thanos/pkg/ui"
 )
 
+const (
+	retryTimeoutDuration  = 30
+	retryIntervalDuration = 10
+)
+
+type syncStrategy string
+
+const (
+	concurrentDiscovery syncStrategy = "concurrent"
+	recursiveDiscovery  syncStrategy = "recursive"
+)
+
 type storeConfig struct {
-	indexCacheConfigs           extflag.PathOrContent
-	objStoreConfig              extflag.PathOrContent
-	dataDir                     string
-	grpcConfig                  grpcConfig
-	httpConfig                  httpConfig
-	indexCacheSizeBytes         units.Base2Bytes
-	chunkPoolSize               units.Base2Bytes
-	maxSampleCount              uint64
-	maxTouchedSeriesCount       uint64
-	maxConcurrency              int
-	component                   component.StoreAPI
-	debugLogging                bool
-	syncInterval                time.Duration
-	blockSyncConcurrency        int
-	blockMetaFetchConcurrency   int
-	filterConf                  *store.FilterConfig
-	selectorRelabelConf         extflag.PathOrContent
-	advertiseCompatibilityLabel bool
-	consistencyDelay            commonmodel.Duration
-	ignoreDeletionMarksDelay    commonmodel.Duration
-	webConfig                   webConfig
-	postingOffsetsInMemSampling int
-	cachingBucketConfig         extflag.PathOrContent
-	reqLogConfig                *extflag.PathOrContent
-	lazyIndexReaderEnabled      bool
-	lazyIndexReaderIdleTimeout  time.Duration
+	indexCacheConfigs             extflag.PathOrContent
+	objStoreConfig                extflag.PathOrContent
+	dataDir                       string
+	cacheIndexHeader              bool
+	grpcConfig                    grpcConfig
+	httpConfig                    httpConfig
+	indexCacheSizeBytes           units.Base2Bytes
+	chunkPoolSize                 units.Base2Bytes
+	estimatedMaxSeriesSize        uint64
+	estimatedMaxChunkSize         uint64
+	seriesBatchSize               int
+	storeRateLimits               store.SeriesSelectLimits
+	maxDownloadedBytes            units.Base2Bytes
+	maxConcurrency                int
+	component                     component.StoreAPI
+	debugLogging                  bool
+	syncInterval                  time.Duration
+	blockListStrategy             string
+	blockSyncConcurrency          int
+	blockMetaFetchConcurrency     int
+	filterConf                    *store.FilterConfig
+	selectorRelabelConf           extflag.PathOrContent
+	advertiseCompatibilityLabel   bool
+	consistencyDelay              commonmodel.Duration
+	ignoreDeletionMarksDelay      commonmodel.Duration
+	disableWeb                    bool
+	webConfig                     webConfig
+	label                         string
+	postingOffsetsInMemSampling   int
+	cachingBucketConfig           extflag.PathOrContent
+	reqLogConfig                  *extflag.PathOrContent
+	lazyIndexReaderEnabled        bool
+	lazyIndexReaderIdleTimeout    time.Duration
+	lazyExpandedPostingsEnabled   bool
+	postingGroupMaxKeySeriesRatio float64
+
+	indexHeaderLazyDownloadStrategy string
+
+	matcherCacheSize int
 }
 
 func (sc *storeConfig) registerFlag(cmd extkingpin.FlagClause) {
 	sc.httpConfig = *sc.httpConfig.registerFlag(cmd)
 	sc.grpcConfig = *sc.grpcConfig.registerFlag(cmd)
+	sc.storeRateLimits.RegisterFlags(cmd)
 
-	cmd.Flag("data-dir", "Local data directory used for caching purposes (index-header, in-mem cache items and meta.jsons). If removed, no data will be lost, just store will have to rebuild the cache. NOTE: Putting raw blocks here will not cause the store to read them. For such use cases use Prometheus + sidecar.").
+	cmd.Flag("data-dir", "Local data directory used for caching purposes (index-header, in-mem cache items and meta.jsons). If removed, no data will be lost, just store will have to rebuild the cache. NOTE: Putting raw blocks here will not cause the store to read them. For such use cases use Prometheus + sidecar. Ignored if --no-cache-index-header option is specified.").
 		Default("./data").StringVar(&sc.dataDir)
+
+	cmd.Flag("cache-index-header", "Cache TSDB index-headers on disk to reduce startup time. When set to true, Thanos Store will download index headers from remote object storage on startup and create a header file on disk. Use --data-dir to set the directory in which index headers will be downloaded.").
+		Default("true").BoolVar(&sc.cacheIndexHeader)
 
 	cmd.Flag("index-cache-size", "Maximum size of items held in the in-memory index cache. Ignored if --index-cache.config or --index-cache.config-file option is specified.").
 		Default("250MB").BytesVar(&sc.indexCacheSizeBytes)
@@ -100,13 +135,12 @@ func (sc *storeConfig) registerFlag(cmd extkingpin.FlagClause) {
 	cmd.Flag("chunk-pool-size", "Maximum size of concurrently allocatable bytes reserved strictly to reuse for chunks in memory.").
 		Default("2GB").BytesVar(&sc.chunkPoolSize)
 
-	cmd.Flag("store.grpc.series-sample-limit",
-		"Maximum amount of samples returned via a single Series call. The Series call fails if this limit is exceeded. 0 means no limit. NOTE: For efficiency the limit is internally implemented as 'chunks limit' considering each chunk contains 120 samples (it's the max number of samples each chunk can contain), so the actual number of samples might be lower, even though the maximum could be hit.").
-		Default("0").Uint64Var(&sc.maxSampleCount)
+	cmd.Flag("store.grpc.touched-series-limit", "DEPRECATED: use store.limits.request-series.").Default("0").Uint64Var(&sc.storeRateLimits.SeriesPerRequest)
+	cmd.Flag("store.grpc.series-sample-limit", "DEPRECATED: use store.limits.request-samples.").Default("0").Uint64Var(&sc.storeRateLimits.SamplesPerRequest)
 
-	cmd.Flag("store.grpc.touched-series-limit",
-		"Maximum amount of touched series returned via a single Series call. The Series call fails if this limit is exceeded. 0 means no limit.").
-		Default("0").Uint64Var(&sc.maxTouchedSeriesCount)
+	cmd.Flag("store.grpc.downloaded-bytes-limit",
+		"Maximum amount of downloaded (either fetched or touched) bytes in a single Series/LabelNames/LabelValues call. The Series call fails if this limit is exceeded. 0 means no limit.").
+		Default("0").BytesVar(&sc.maxDownloadedBytes)
 
 	cmd.Flag("store.grpc.series-max-concurrency", "Maximum number of concurrent Series calls.").Default("20").IntVar(&sc.maxConcurrency)
 
@@ -115,13 +149,26 @@ func (sc *storeConfig) registerFlag(cmd extkingpin.FlagClause) {
 	sc.objStoreConfig = *extkingpin.RegisterCommonObjStoreFlags(cmd, "", true)
 
 	cmd.Flag("sync-block-duration", "Repeat interval for syncing the blocks between local and remote view.").
-		Default("3m").DurationVar(&sc.syncInterval)
+		Default("15m").DurationVar(&sc.syncInterval)
+
+	strategies := strings.Join([]string{string(concurrentDiscovery), string(recursiveDiscovery)}, ", ")
+	cmd.Flag("block-discovery-strategy", "One of "+strategies+". When set to concurrent, stores will concurrently issue one call per directory to discover active blocks in the bucket. The recursive strategy iterates through all objects in the bucket, recursively traversing into each directory. This avoids N+1 calls at the expense of having slower bucket iterations.").
+		Default(string(concurrentDiscovery)).StringVar(&sc.blockListStrategy)
 
 	cmd.Flag("block-sync-concurrency", "Number of goroutines to use when constructing index-cache.json blocks from object storage. Must be equal or greater than 1.").
 		Default("20").IntVar(&sc.blockSyncConcurrency)
 
 	cmd.Flag("block-meta-fetch-concurrency", "Number of goroutines to use when fetching block metadata from object storage.").
 		Default("32").IntVar(&sc.blockMetaFetchConcurrency)
+
+	cmd.Flag("debug.series-batch-size", "The batch size when fetching series from TSDB blocks. Setting the number too high can lead to slower retrieval, while setting it too low can lead to throttling caused by too many calls made to object storage.").
+		Hidden().Default(strconv.Itoa(store.SeriesBatchSize)).IntVar(&sc.seriesBatchSize)
+
+	cmd.Flag("debug.estimated-max-series-size", "Estimated max series size. Setting a value might result in over fetching data while a small value might result in data refetch. Default value is 64KB.").
+		Hidden().Default(strconv.Itoa(store.EstimatedMaxSeriesSize)).Uint64Var(&sc.estimatedMaxSeriesSize)
+
+	cmd.Flag("debug.estimated-max-chunk-size", "Estimated max chunk size. Setting a value might result in over fetching data while a small value might result in data refetch. Default value is 16KiB.").
+		Hidden().Default(strconv.Itoa(store.EstimatedMaxChunkSize)).Uint64Var(&sc.estimatedMaxChunkSize)
 
 	sc.filterConf = &store.FilterConfig{}
 
@@ -157,6 +204,18 @@ func (sc *storeConfig) registerFlag(cmd extkingpin.FlagClause) {
 	cmd.Flag("store.index-header-lazy-reader-idle-timeout", "If index-header lazy reader is enabled and this idle timeout setting is > 0, memory map-ed index-headers will be automatically released after 'idle timeout' inactivity.").
 		Hidden().Default("5m").DurationVar(&sc.lazyIndexReaderIdleTimeout)
 
+	cmd.Flag("store.enable-lazy-expanded-postings", "If true, Store Gateway will estimate postings size and try to lazily expand postings if it downloads less data than expanding all postings.").
+		Default("false").BoolVar(&sc.lazyExpandedPostingsEnabled)
+
+	cmd.Flag("store.posting-group-max-key-series-ratio", "Mark posting group as lazy if it fetches more keys than R * max series the query should fetch. With R set to 100, a posting group which fetches 100K keys will be marked as lazy if the current query only fetches 1000 series. thanos_bucket_store_lazy_expanded_posting_groups_total shows lazy expanded postings groups with reasons and you can tune this config accordingly. This config is only valid if lazy expanded posting is enabled. 0 disables the limit.").
+		Default("100").Float64Var(&sc.postingGroupMaxKeySeriesRatio)
+
+	cmd.Flag("store.index-header-lazy-download-strategy", "Strategy of how to download index headers lazily. Supported values: eager, lazy. If eager, always download index header during initial load. If lazy, download index header during query time.").
+		Default(string(indexheader.EagerDownloadStrategy)).
+		EnumVar(&sc.indexHeaderLazyDownloadStrategy, string(indexheader.EagerDownloadStrategy), string(indexheader.LazyDownloadStrategy))
+
+	cmd.Flag("web.disable", "Disable Block Viewer UI.").Default("false").BoolVar(&sc.disableWeb)
+
 	cmd.Flag("web.external-prefix", "Static prefix for all HTML links and redirect URLs in the bucket web UI interface. Actual endpoints are still served on / or the web.route-prefix. This allows thanos bucket web UI to be served behind a reverse proxy that strips a URL sub-path.").
 		Default("").StringVar(&sc.webConfig.externalPrefix)
 
@@ -165,6 +224,10 @@ func (sc *storeConfig) registerFlag(cmd extkingpin.FlagClause) {
 
 	cmd.Flag("web.disable-cors", "Whether to disable CORS headers to be set by Thanos. By default Thanos sets CORS headers to be allowed by all.").
 		Default("false").BoolVar(&sc.webConfig.disableCORS)
+
+	cmd.Flag("bucket-web-label", "External block label to use as group title in the bucket web UI").StringVar(&sc.label)
+
+	cmd.Flag("matcher-cache-size", "Max number of cached matchers items. Using 0 disables caching.").Default("0").IntVar(&sc.matcherCacheSize)
 
 	sc.reqLogConfig = extkingpin.RegisterRequestLoggingFlags(cmd)
 }
@@ -182,15 +245,18 @@ func registerStore(app *extkingpin.App) {
 				conf.filterConf.MinTime, conf.filterConf.MaxTime)
 		}
 
-		httpLogOpts, err := logging.ParseHTTPOptions("", conf.reqLogConfig)
+		httpLogOpts, err := logging.ParseHTTPOptions(conf.reqLogConfig)
 		if err != nil {
 			return errors.Wrap(err, "error while parsing config for request logging")
 		}
 
-		tagOpts, grpcLogOpts, err := logging.ParsegRPCOptions("", conf.reqLogConfig)
+		grpcLogOpts, logFilterMethods, err := logging.ParsegRPCOptions(conf.reqLogConfig)
+
 		if err != nil {
 			return errors.Wrap(err, "error while parsing config for request logging")
 		}
+
+		conf.debugLogging = debugLogging
 
 		return runStore(g,
 			logger,
@@ -198,7 +264,7 @@ func registerStore(app *extkingpin.App) {
 			tracer,
 			httpLogOpts,
 			grpcLogOpts,
-			tagOpts,
+			logFilterMethods,
 			*conf,
 			getFlagsMap(cmd.Flags()),
 		)
@@ -213,10 +279,15 @@ func runStore(
 	tracer opentracing.Tracer,
 	httpLogOpts []logging.Option,
 	grpcLogOpts []grpclogging.Option,
-	tagOpts []tags.Option,
+	logFilterMethods []string,
 	conf storeConfig,
 	flagsMap map[string]string,
 ) error {
+	dataDir := conf.dataDir
+	if !conf.cacheIndexHeader {
+		dataDir = ""
+	}
+
 	grpcProbe := prober.NewGRPC()
 	httpProbe := prober.NewHTTP()
 	statusProber := prober.Combine(
@@ -229,6 +300,7 @@ func runStore(
 		httpserver.WithListen(conf.httpConfig.bindAddress),
 		httpserver.WithGracePeriod(time.Duration(conf.httpConfig.gracePeriod)),
 		httpserver.WithTLSConfig(conf.httpConfig.tlsConfig),
+		httpserver.WithEnableH2C(true), // For groupcache.
 	)
 
 	g.Add(func() error {
@@ -246,18 +318,25 @@ func runStore(
 	if err != nil {
 		return err
 	}
-
-	bkt, err := client.NewBucket(logger, confContentYaml, reg, conf.component.String())
-	if err != nil {
-		return errors.Wrap(err, "create bucket client")
+	customBktConfig := exthttp.DefaultCustomBucketConfig()
+	if err := yaml.Unmarshal(confContentYaml, &customBktConfig); err != nil {
+		return errors.Wrap(err, "parsing config YAML file")
 	}
+	bkt, err := client.NewBucket(logger, confContentYaml, conf.component.String(), exthttp.CreateHedgedTransportWithConfig(customBktConfig))
+	if err != nil {
+		return err
+	}
+	insBkt := objstoretracing.WrapWithTraces(objstore.WrapWithMetrics(bkt, extprom.WrapRegistererWithPrefix("thanos_", reg), bkt.Name()))
 
 	cachingBucketConfigYaml, err := conf.cachingBucketConfig.Content()
 	if err != nil {
 		return errors.Wrap(err, "get caching bucket configuration")
 	}
+
+	r := route.New()
+
 	if len(cachingBucketConfigYaml) > 0 {
-		bkt, err = storecache.NewCachingBucketFromYaml(cachingBucketConfigYaml, bkt, logger, reg)
+		insBkt, err = storecache.NewCachingBucketFromYaml(cachingBucketConfigYaml, insBkt, logger, reg, r, conf.cachingBucketConfig.Path())
 		if err != nil {
 			return errors.Wrap(err, "create caching bucket")
 		}
@@ -278,20 +357,13 @@ func runStore(
 		return errors.Wrap(err, "get content of index cache configuration")
 	}
 
-	// Ensure we close up everything properly.
-	defer func() {
-		if err != nil {
-			runutil.CloseWithLogOnErr(logger, bkt, "bucket client")
-		}
-	}()
-
 	// Create the index cache loading its config from config file, while keeping
 	// backward compatibility with the pre-config file era.
 	var indexCache storecache.IndexCache
 	if len(indexCacheContentYaml) > 0 {
 		indexCache, err = storecache.NewIndexCache(logger, indexCacheContentYaml, reg)
 	} else {
-		indexCache, err = storecache.NewInMemoryIndexCacheWithConfig(logger, reg, storecache.InMemoryIndexCacheConfig{
+		indexCache, err = storecache.NewInMemoryIndexCacheWithConfig(logger, nil, reg, storecache.InMemoryIndexCacheConfig{
 			MaxSize:     model.Bytes(conf.indexCacheSizeBytes),
 			MaxItemSize: storecache.DefaultInMemoryIndexCacheConfig.MaxItemSize,
 		})
@@ -300,15 +372,32 @@ func runStore(
 		return errors.Wrap(err, "create index cache")
 	}
 
-	ignoreDeletionMarkFilter := block.NewIgnoreDeletionMarkFilter(logger, bkt, time.Duration(conf.ignoreDeletionMarksDelay), conf.blockMetaFetchConcurrency)
-	metaFetcher, err := block.NewMetaFetcher(logger, conf.blockMetaFetchConcurrency, bkt, conf.dataDir, extprom.WrapRegistererWithPrefix("thanos_", reg),
+	var matchersCache = storecache.NoopMatchersCache
+	if conf.matcherCacheSize > 0 {
+		matchersCache, err = storecache.NewMatchersCache(storecache.WithSize(conf.matcherCacheSize), storecache.WithPromRegistry(reg))
+		if err != nil {
+			return errors.Wrap(err, "failed to create matchers cache")
+		}
+	}
+
+	var blockLister block.Lister
+	switch syncStrategy(conf.blockListStrategy) {
+	case concurrentDiscovery:
+		blockLister = block.NewConcurrentLister(logger, insBkt)
+	case recursiveDiscovery:
+		blockLister = block.NewRecursiveLister(logger, insBkt)
+	default:
+		return errors.Errorf("unknown sync strategy %s", conf.blockListStrategy)
+	}
+	ignoreDeletionMarkFilter := block.NewIgnoreDeletionMarkFilter(logger, insBkt, time.Duration(conf.ignoreDeletionMarksDelay), conf.blockMetaFetchConcurrency)
+	metaFetcher, err := block.NewMetaFetcher(logger, conf.blockMetaFetchConcurrency, insBkt, blockLister, dataDir, extprom.WrapRegistererWithPrefix("thanos_", reg),
 		[]block.MetadataFilter{
 			block.NewTimePartitionMetaFilter(conf.filterConf.MinTime, conf.filterConf.MaxTime),
 			block.NewLabelShardedMetaFilter(relabelConfig),
 			block.NewConsistencyDelayMetaFilter(logger, time.Duration(conf.consistencyDelay), extprom.WrapRegistererWithPrefix("thanos_", reg)),
 			ignoreDeletionMarkFilter,
-			block.NewDeduplicateFilter(),
-		}, nil)
+			block.NewDeduplicateFilter(conf.blockMetaFetchConcurrency),
+		})
 	if err != nil {
 		return errors.Wrap(err, "meta fetcher")
 	}
@@ -318,7 +407,7 @@ func runStore(
 		return errors.Errorf("max concurrency value cannot be lower than 0 (got %v)", conf.maxConcurrency)
 	}
 
-	queriesGate := gate.New(extprom.WrapRegistererWithPrefix("thanos_bucket_store_series_", reg), int(conf.maxConcurrency))
+	queriesGate := gate.New(extprom.WrapRegistererWithPrefix("thanos_bucket_store_series_", reg), int(conf.maxConcurrency), gate.Queries)
 
 	chunkPool, err := store.NewDefaultChunkBytesPool(uint64(conf.chunkPoolSize))
 	if err != nil {
@@ -327,11 +416,41 @@ func runStore(
 
 	options := []store.BucketStoreOption{
 		store.WithLogger(logger),
+		store.WithRequestLoggerFunc(func(ctx context.Context, logger log.Logger) log.Logger {
+			reqID, ok := middleware.RequestIDFromContext(ctx)
+			if ok {
+				return log.With(logger, "request-id", reqID)
+			}
+			return logger
+		}),
 		store.WithRegistry(reg),
 		store.WithIndexCache(indexCache),
+		store.WithMatchersCache(matchersCache),
 		store.WithQueryGate(queriesGate),
 		store.WithChunkPool(chunkPool),
 		store.WithFilterConfig(conf.filterConf),
+		store.WithChunkHashCalculation(true),
+		store.WithSeriesBatchSize(conf.seriesBatchSize),
+		store.WithBlockEstimatedMaxSeriesFunc(func(m metadata.Meta) uint64 {
+			if m.Thanos.IndexStats.SeriesMaxSize > 0 &&
+				uint64(m.Thanos.IndexStats.SeriesMaxSize) < conf.estimatedMaxSeriesSize {
+				return uint64(m.Thanos.IndexStats.SeriesMaxSize)
+			}
+			return conf.estimatedMaxSeriesSize
+		}),
+		store.WithBlockEstimatedMaxChunkFunc(func(m metadata.Meta) uint64 {
+			if m.Thanos.IndexStats.ChunkMaxSize > 0 &&
+				uint64(m.Thanos.IndexStats.ChunkMaxSize) < conf.estimatedMaxChunkSize {
+				return uint64(m.Thanos.IndexStats.ChunkMaxSize)
+			}
+			return conf.estimatedMaxChunkSize
+		}),
+		store.WithLazyExpandedPostings(conf.lazyExpandedPostingsEnabled),
+		store.WithPostingGroupMaxKeySeriesRatio(conf.postingGroupMaxKeySeriesRatio),
+		store.WithSeriesMatchRatio(0.5), // TODO: expose series match ratio as config.
+		store.WithIndexHeaderLazyDownloadStrategy(
+			indexheader.IndexHeaderLazyDownloadStrategy(conf.indexHeaderLazyDownloadStrategy).StrategyToDownloadFunc(),
+		),
 	}
 
 	if conf.debugLogging {
@@ -339,11 +458,12 @@ func runStore(
 	}
 
 	bs, err := store.NewBucketStore(
-		bkt,
+		insBkt,
 		metaFetcher,
-		conf.dataDir,
-		store.NewChunksLimiterFactory(conf.maxSampleCount/store.MaxSamplesPerChunk), // The samples limit is an approximation based on the max number of samples per chunk.
-		store.NewSeriesLimiterFactory(conf.maxTouchedSeriesCount),
+		dataDir,
+		store.NewChunksLimiterFactory(conf.storeRateLimits.SamplesPerRequest/store.MaxSamplesPerChunk), // The samples limit is an approximation based on the max number of samples per chunk.
+		store.NewSeriesLimiterFactory(conf.storeRateLimits.SeriesPerRequest),
+		store.NewBytesLimiterFactory(conf.maxDownloadedBytes),
 		store.NewGapBasedPartitioner(store.PartitionerMaxGapSize),
 		conf.blockSyncConcurrency,
 		conf.advertiseCompatibilityLabel,
@@ -362,18 +482,29 @@ func runStore(
 	{
 		ctx, cancel := context.WithCancel(context.Background())
 		g.Add(func() error {
-			defer runutil.CloseWithLogOnErr(logger, bkt, "bucket client")
+			defer runutil.CloseWithLogOnErr(logger, insBkt, "bucket client")
 
 			level.Info(logger).Log("msg", "initializing bucket store")
 			begin := time.Now()
-			if err := bs.InitialSync(ctx); err != nil {
+
+			// This will stop retrying after set timeout duration.
+			initialSyncCtx, cancel := context.WithTimeout(ctx, retryTimeoutDuration*time.Second)
+			defer cancel()
+
+			// Retry in case of error.
+			err := runutil.Retry(retryIntervalDuration*time.Second, initialSyncCtx.Done(), func() error {
+				return bs.InitialSync(ctx)
+			})
+
+			if err != nil {
 				close(bucketStoreReady)
 				return errors.Wrap(err, "bucket store initial sync")
 			}
+
 			level.Info(logger).Log("msg", "bucket store ready", "init_duration", time.Since(begin).String())
 			close(bucketStoreReady)
 
-			err := runutil.Repeat(conf.syncInterval, ctx.Done(), func() error {
+			err = runutil.Repeat(conf.syncInterval, ctx.Done(), func() error {
 				if err := bs.SyncBlocks(ctx); err != nil {
 					level.Warn(logger).Log("msg", "syncing blocks failed", "err", err)
 				}
@@ -392,27 +523,35 @@ func runStore(
 		info.WithLabelSetFunc(func() []labelpb.ZLabelSet {
 			return bs.LabelSet()
 		}),
-		info.WithStoreInfoFunc(func() *infopb.StoreInfo {
-			mint, maxt := bs.TimeRange()
-			return &infopb.StoreInfo{
-				MinTime: mint,
-				MaxTime: maxt,
+		info.WithStoreInfoFunc(func() (*infopb.StoreInfo, error) {
+			if httpProbe.IsReady() {
+				mint, maxt := bs.TimeRange()
+				return &infopb.StoreInfo{
+					MinTime:                      mint,
+					MaxTime:                      maxt,
+					SupportsSharding:             true,
+					SupportsWithoutReplicaLabels: true,
+					TsdbInfos:                    bs.TSDBInfos(),
+				}, nil
 			}
+			return nil, errors.New("Not ready")
 		}),
 	)
 
 	// Start query (proxy) gRPC StoreAPI.
 	{
-		tlsCfg, err := tls.NewServerConfig(log.With(logger, "protocol", "gRPC"), conf.grpcConfig.tlsSrvCert, conf.grpcConfig.tlsSrvKey, conf.grpcConfig.tlsSrvClientCA)
+		tlsCfg, err := tls.NewServerConfig(log.With(logger, "protocol", "gRPC"), conf.grpcConfig.tlsSrvCert, conf.grpcConfig.tlsSrvKey, conf.grpcConfig.tlsSrvClientCA, conf.grpcConfig.tlsMinVersion)
 		if err != nil {
 			return errors.Wrap(err, "setup gRPC server")
 		}
 
-		s := grpcserver.New(logger, reg, tracer, grpcLogOpts, tagOpts, conf.component, grpcProbe,
-			grpcserver.WithServer(store.RegisterStoreServer(bs)),
+		storeServer := store.NewInstrumentedStoreServer(reg, bs)
+		s := grpcserver.New(logger, reg, tracer, grpcLogOpts, logFilterMethods, conf.component, grpcProbe,
+			grpcserver.WithServer(store.RegisterStoreServer(storeServer, logger)),
 			grpcserver.WithServer(info.RegisterInfoServer(infoSrv)),
 			grpcserver.WithListen(conf.grpcConfig.bindAddress),
-			grpcserver.WithGracePeriod(time.Duration(conf.grpcConfig.gracePeriod)),
+			grpcserver.WithGracePeriod(conf.grpcConfig.gracePeriod),
+			grpcserver.WithMaxConnAge(conf.grpcConfig.maxConnectionAge),
 			grpcserver.WithTLSConfig(tlsCfg),
 		)
 
@@ -425,23 +564,25 @@ func runStore(
 			s.Shutdown(err)
 		})
 	}
+
 	// Add bucket UI for loaded blocks.
 	{
-		r := route.New()
 		ins := extpromhttp.NewInstrumentationMiddleware(reg, nil)
 
-		compactorView := ui.NewBucketUI(logger, "", conf.webConfig.externalPrefix, conf.webConfig.prefixHeaderName, "/loaded", conf.component)
-		compactorView.Register(r, true, ins)
+		if !conf.disableWeb {
+			compactorView := ui.NewBucketUI(logger, conf.webConfig.externalPrefix, conf.webConfig.prefixHeaderName, conf.component)
+			compactorView.Register(r, ins)
 
-		// Configure Request Logging for HTTP calls.
-		logMiddleware := logging.NewHTTPServerMiddleware(logger, httpLogOpts...)
-		api := blocksAPI.NewBlocksAPI(logger, conf.webConfig.disableCORS, "", flagsMap, bkt)
-		api.Register(r.WithPrefix("/api/v1"), tracer, logger, ins, logMiddleware)
+			// Configure Request Logging for HTTP calls.
+			logMiddleware := logging.NewHTTPServerMiddleware(logger, httpLogOpts...)
+			api := blocksAPI.NewBlocksAPI(logger, conf.webConfig.disableCORS, conf.label, flagsMap, insBkt)
+			api.Register(r.WithPrefix("/api/v1"), tracer, logger, ins, logMiddleware)
 
-		metaFetcher.UpdateOnChange(func(blocks []metadata.Meta, err error) {
-			compactorView.Set(blocks, err)
-			api.SetLoaded(blocks, err)
-		})
+			metaFetcher.UpdateOnChange(func(blocks []metadata.Meta, err error) {
+				api.SetLoaded(blocks, err)
+			})
+		}
+
 		srv.Handle("/", r)
 	}
 

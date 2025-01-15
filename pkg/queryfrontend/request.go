@@ -6,17 +6,41 @@ package queryfrontend
 import (
 	"time"
 
-	"github.com/cortexproject/cortex/pkg/querier/queryrange"
+	"github.com/thanos-io/thanos/pkg/store/storepb"
+
 	"github.com/opentracing/opentracing-go"
 	otlog "github.com/opentracing/opentracing-go/log"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/timestamp"
+
+	"github.com/thanos-io/thanos/internal/cortex/querier/queryrange"
 )
 
-// TODO(yeya24): add partial result when needed.
-// ThanosRequest is a common interface defined for specific thanos requests.
-type ThanosRequest interface {
+// ThanosRequestStoreMatcherGetter is a an interface for store matching that all request share.
+// TODO(yeya24): Add partial result when needed.
+type ThanosRequestStoreMatcherGetter interface {
 	GetStoreMatchers() [][]*labels.Matcher
+}
+
+// ShardedRequest interface represents a query request that can be sharded vertically.
+type ShardedRequest interface {
+	WithShardInfo(info *storepb.ShardInfo) queryrange.Request
+}
+
+// SplitRequest interface represents a query request that can be split horizontally.
+type SplitRequest interface {
+	GetSplitInterval() time.Duration
+	WithSplitInterval(interval time.Duration) queryrange.Request
+}
+
+type RequestHeader struct {
+	Name   string
+	Values []string
+}
+
+// ThanosRequestDedup is a an interface for all requests that share setting deduplication.
+type ThanosRequestDedup interface {
+	IsDedupEnabled() bool
 }
 
 type ThanosQueryRangeRequest struct {
@@ -33,7 +57,20 @@ type ThanosQueryRangeRequest struct {
 	ReplicaLabels       []string
 	StoreMatchers       [][]*labels.Matcher
 	CachingOptions      queryrange.CachingOptions
+	Headers             []*RequestHeader
+	Stats               string
+	ShardInfo           *storepb.ShardInfo
+	LookbackDelta       int64
+	Analyze             bool
+	Engine              string
+	SplitInterval       time.Duration
 }
+
+// IsDedupEnabled returns true if deduplication is enabled.
+func (r *ThanosQueryRangeRequest) IsDedupEnabled() bool { return r.Dedup }
+
+// GetStoreMatchers returns store matches.
+func (r *ThanosQueryRangeRequest) GetStoreMatchers() [][]*labels.Matcher { return r.StoreMatchers }
 
 // GetStart returns the start timestamp of the request in milliseconds.
 func (r *ThanosQueryRangeRequest) GetStart() int64 { return r.Start }
@@ -51,6 +88,16 @@ func (r *ThanosQueryRangeRequest) GetCachingOptions() queryrange.CachingOptions 
 	return r.CachingOptions
 }
 
+func (r *ThanosQueryRangeRequest) GetStats() string { return r.Stats }
+
+func (r *ThanosQueryRangeRequest) GetSplitInterval() time.Duration { return r.SplitInterval }
+
+func (r *ThanosQueryRangeRequest) WithStats(stats string) queryrange.Request {
+	q := *r
+	q.Stats = stats
+	return &q
+}
+
 // WithStartEnd clone the current request with different start and end timestamp.
 func (r *ThanosQueryRangeRequest) WithStartEnd(start, end int64) queryrange.Request {
 	q := *r
@@ -63,6 +110,20 @@ func (r *ThanosQueryRangeRequest) WithStartEnd(start, end int64) queryrange.Requ
 func (r *ThanosQueryRangeRequest) WithQuery(query string) queryrange.Request {
 	q := *r
 	q.Query = query
+	return &q
+}
+
+// WithShardInfo clones the current request with a different shard info.
+func (r *ThanosQueryRangeRequest) WithShardInfo(info *storepb.ShardInfo) queryrange.Request {
+	q := *r
+	q.ShardInfo = info
+	return &q
+}
+
+// WithSplitInterval clones the current request with a different split interval.
+func (r *ThanosQueryRangeRequest) WithSplitInterval(interval time.Duration) queryrange.Request {
+	q := *r
+	q.SplitInterval = interval
 	return &q
 }
 
@@ -96,7 +157,99 @@ func (r *ThanosQueryRangeRequest) String() string { return "" }
 // which is not used in thanos.
 func (r *ThanosQueryRangeRequest) ProtoMessage() {}
 
-func (r *ThanosQueryRangeRequest) GetStoreMatchers() [][]*labels.Matcher { return r.StoreMatchers }
+type ThanosQueryInstantRequest struct {
+	Path                string
+	Time                int64
+	Timeout             time.Duration
+	Query               string
+	Dedup               bool
+	PartialResponse     bool
+	AutoDownsampling    bool
+	MaxSourceResolution int64
+	ReplicaLabels       []string
+	StoreMatchers       [][]*labels.Matcher
+	Headers             []*RequestHeader
+	Stats               string
+	ShardInfo           *storepb.ShardInfo
+	LookbackDelta       int64 // in milliseconds.
+	Analyze             bool
+	Engine              string
+}
+
+// IsDedupEnabled returns true if deduplication is enabled.
+func (r *ThanosQueryInstantRequest) IsDedupEnabled() bool { return r.Dedup }
+
+// GetStoreMatchers returns store matches.
+func (r *ThanosQueryInstantRequest) GetStoreMatchers() [][]*labels.Matcher { return r.StoreMatchers }
+
+// GetStart returns the start timestamp of the request in milliseconds.
+func (r *ThanosQueryInstantRequest) GetStart() int64 { return 0 }
+
+// GetEnd returns the end timestamp of the request in milliseconds.
+func (r *ThanosQueryInstantRequest) GetEnd() int64 { return 0 }
+
+// GetStep returns the step of the request in milliseconds.
+func (r *ThanosQueryInstantRequest) GetStep() int64 { return 0 }
+
+// GetQuery returns the query of the request.
+func (r *ThanosQueryInstantRequest) GetQuery() string { return r.Query }
+
+func (r *ThanosQueryInstantRequest) GetCachingOptions() queryrange.CachingOptions {
+	return queryrange.CachingOptions{}
+}
+
+func (r *ThanosQueryInstantRequest) GetStats() string { return r.Stats }
+
+func (r *ThanosQueryInstantRequest) WithStats(stats string) queryrange.Request {
+	q := *r
+	q.Stats = stats
+	return &q
+}
+
+// WithStartEnd clone the current request with different start and end timestamp.
+func (r *ThanosQueryInstantRequest) WithStartEnd(_, _ int64) queryrange.Request { return nil }
+
+// WithQuery clone the current request with a different query.
+func (r *ThanosQueryInstantRequest) WithQuery(query string) queryrange.Request {
+	q := *r
+	q.Query = query
+	return &q
+}
+
+// WithShardInfo clones the current request with a different shard info.
+func (r *ThanosQueryInstantRequest) WithShardInfo(info *storepb.ShardInfo) queryrange.Request {
+	q := *r
+	q.ShardInfo = info
+	return &q
+}
+
+// LogToSpan writes information about this request to an OpenTracing span.
+func (r *ThanosQueryInstantRequest) LogToSpan(sp opentracing.Span) {
+	fields := []otlog.Field{
+		otlog.String("query", r.GetQuery()),
+		otlog.Int64("time", r.Time),
+		otlog.Bool("dedup", r.Dedup),
+		otlog.Bool("partial_response", r.PartialResponse),
+		otlog.Object("replicaLabels", r.ReplicaLabels),
+		otlog.Object("storeMatchers", r.StoreMatchers),
+		otlog.Bool("auto-downsampling", r.AutoDownsampling),
+		otlog.Int64("max_source_resolution (ms)", r.MaxSourceResolution),
+	}
+
+	sp.LogFields(fields...)
+}
+
+// Reset implements proto.Message interface required by queryrange.Request,
+// which is not used in thanos.
+func (r *ThanosQueryInstantRequest) Reset() {}
+
+// String implements proto.Message interface required by queryrange.Request,
+// which is not used in thanos.
+func (r *ThanosQueryInstantRequest) String() string { return "" }
+
+// ProtoMessage implements proto.Message interface required by queryrange.Request,
+// which is not used in thanos.
+func (r *ThanosQueryInstantRequest) ProtoMessage() {}
 
 type ThanosLabelsRequest struct {
 	Start           int64
@@ -107,7 +260,13 @@ type ThanosLabelsRequest struct {
 	StoreMatchers   [][]*labels.Matcher
 	PartialResponse bool
 	CachingOptions  queryrange.CachingOptions
+	Headers         []*RequestHeader
+	Stats           string
+	SplitInterval   time.Duration
 }
+
+// GetStoreMatchers returns store matches.
+func (r *ThanosLabelsRequest) GetStoreMatchers() [][]*labels.Matcher { return r.StoreMatchers }
 
 // GetStart returns the start timestamp of the request in milliseconds.
 func (r *ThanosLabelsRequest) GetStart() int64 { return r.Start }
@@ -124,6 +283,16 @@ func (r *ThanosLabelsRequest) GetQuery() string { return "" }
 
 func (r *ThanosLabelsRequest) GetCachingOptions() queryrange.CachingOptions { return r.CachingOptions }
 
+func (r *ThanosLabelsRequest) GetStats() string { return r.Stats }
+
+func (r *ThanosLabelsRequest) GetSplitInterval() time.Duration { return r.SplitInterval }
+
+func (r *ThanosLabelsRequest) WithStats(stats string) queryrange.Request {
+	q := *r
+	q.Stats = stats
+	return &q
+}
+
 // WithStartEnd clone the current request with different start and end timestamp.
 func (r *ThanosLabelsRequest) WithStartEnd(start, end int64) queryrange.Request {
 	q := *r
@@ -135,6 +304,13 @@ func (r *ThanosLabelsRequest) WithStartEnd(start, end int64) queryrange.Request 
 // WithQuery clone the current request with a different query.
 func (r *ThanosLabelsRequest) WithQuery(_ string) queryrange.Request {
 	q := *r
+	return &q
+}
+
+// WithSplitInterval clones the current request with a different split interval.
+func (r *ThanosLabelsRequest) WithSplitInterval(interval time.Duration) queryrange.Request {
+	q := *r
+	q.SplitInterval = interval
 	return &q
 }
 
@@ -166,8 +342,6 @@ func (r *ThanosLabelsRequest) String() string { return "" }
 // which is not used in thanos.
 func (r *ThanosLabelsRequest) ProtoMessage() {}
 
-func (r *ThanosLabelsRequest) GetStoreMatchers() [][]*labels.Matcher { return r.StoreMatchers }
-
 type ThanosSeriesRequest struct {
 	Path            string
 	Start           int64
@@ -178,7 +352,16 @@ type ThanosSeriesRequest struct {
 	Matchers        [][]*labels.Matcher
 	StoreMatchers   [][]*labels.Matcher
 	CachingOptions  queryrange.CachingOptions
+	Headers         []*RequestHeader
+	Stats           string
+	SplitInterval   time.Duration
 }
+
+// IsDedupEnabled returns true if deduplication is enabled.
+func (r *ThanosSeriesRequest) IsDedupEnabled() bool { return r.Dedup }
+
+// GetStoreMatchers returns store matches.
+func (r *ThanosSeriesRequest) GetStoreMatchers() [][]*labels.Matcher { return r.StoreMatchers }
 
 // GetStart returns the start timestamp of the request in milliseconds.
 func (r *ThanosSeriesRequest) GetStart() int64 { return r.Start }
@@ -195,6 +378,16 @@ func (r *ThanosSeriesRequest) GetQuery() string { return "" }
 
 func (r *ThanosSeriesRequest) GetCachingOptions() queryrange.CachingOptions { return r.CachingOptions }
 
+func (r *ThanosSeriesRequest) GetStats() string { return r.Stats }
+
+func (r *ThanosSeriesRequest) GetSplitInterval() time.Duration { return r.SplitInterval }
+
+func (r *ThanosSeriesRequest) WithStats(stats string) queryrange.Request {
+	q := *r
+	q.Stats = stats
+	return &q
+}
+
 // WithStartEnd clone the current request with different start and end timestamp.
 func (r *ThanosSeriesRequest) WithStartEnd(start, end int64) queryrange.Request {
 	q := *r
@@ -206,6 +399,13 @@ func (r *ThanosSeriesRequest) WithStartEnd(start, end int64) queryrange.Request 
 // WithQuery clone the current request with a different query.
 func (r *ThanosSeriesRequest) WithQuery(_ string) queryrange.Request {
 	q := *r
+	return &q
+}
+
+// WithSplitInterval clones the current request with a different split interval.
+func (r *ThanosSeriesRequest) WithSplitInterval(interval time.Duration) queryrange.Request {
+	q := *r
+	q.SplitInterval = interval
 	return &q
 }
 
@@ -235,5 +435,3 @@ func (r *ThanosSeriesRequest) String() string { return "" }
 // ProtoMessage implements proto.Message interface required by queryrange.Request,
 // which is not used in thanos.
 func (r *ThanosSeriesRequest) ProtoMessage() {}
-
-func (r *ThanosSeriesRequest) GetStoreMatchers() [][]*labels.Matcher { return r.StoreMatchers }

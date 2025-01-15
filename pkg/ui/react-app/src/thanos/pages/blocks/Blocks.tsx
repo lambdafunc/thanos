@@ -10,10 +10,11 @@ import { SourceView } from './SourceView';
 import { BlockDetails } from './BlockDetails';
 import { BlockSearchInput } from './BlockSearchInput';
 import { BlockFilterCompaction } from './BlockFilterCompaction';
-import { sortBlocks } from './helpers';
+import { sortBlocks, getBlockByUlid, getFilteredBlockPools } from './helpers';
 import styles from './blocks.module.css';
 import TimeRange from './TimeRange';
 import Checkbox from '../../../components/Checkbox';
+import { FlagMap } from '../../../pages/flags/Flags';
 
 export interface BlockListProps {
   blocks: Block[];
@@ -22,7 +23,7 @@ export interface BlockListProps {
   refreshedAt: string;
 }
 
-export const BlocksContent: FC<{ data: BlockListProps }> = ({ data }) => {
+export const BlocksContent: FC<{ data: BlockListProps } & PathPrefixProps> = ({ pathPrefix = '', data }) => {
   const [selectedBlock, selectBlock] = useState<Block>();
   const [searchState, setSearchState] = useState<string>('');
 
@@ -71,6 +72,11 @@ export const BlocksContent: FC<{ data: BlockListProps }> = ({ data }) => {
   const [blockSearch, setBlockSearch] = useState<string>(blockSearchParam);
 
   const blockPools = useMemo(() => sortBlocks(blocks, label, findOverlappingBlocks), [blocks, label, findOverlappingBlocks]);
+  const filteredBlocks = useMemo(() => getBlockByUlid(blocks, blockSearch), [blocks, blockSearch]);
+  const filteredBlockPools = useMemo(() => getFilteredBlockPools(blockPools, filteredBlocks), [filteredBlocks, blockPools]);
+
+  const { response: flagsRes } = useFetch<FlagMap>(`${pathPrefix}/api/v1/status/flags`);
+  const disableAdminOperations = flagsRes?.data?.['disable-admin-operations'] === 'true' || false;
 
   const setViewTime = (times: number[]): void => {
     setQuery({
@@ -89,7 +95,7 @@ export const BlocksContent: FC<{ data: BlockListProps }> = ({ data }) => {
   const onChangeCompactionCheckbox = (target: EventTarget & HTMLInputElement) => {
     setFilterCompaction(target.checked);
     if (target.checked) {
-      let compactionLevel: number = parseInt(compactionLevelInput);
+      const compactionLevel: number = parseInt(compactionLevelInput);
       setQuery({
         'filter-compaction': target.checked,
         'compaction-level': compactionLevel,
@@ -151,18 +157,24 @@ export const BlocksContent: FC<{ data: BlockListProps }> = ({ data }) => {
           <div className={styles.container}>
             <div className={styles.grid}>
               <div className={styles.sources}>
-                {Object.keys(blockPools).map((pk) => (
-                  <SourceView
-                    key={pk}
-                    data={blockPools[pk]}
-                    title={pk}
-                    selectBlock={selectBlock}
-                    gridMinTime={viewMinTime}
-                    gridMaxTime={viewMaxTime}
-                    blockSearch={blockSearch}
-                    compactionLevel={compactionLevel}
-                  />
-                ))}
+                {Object.keys(filteredBlockPools).length > 0 ? (
+                  Object.keys(filteredBlockPools).map((pk) => (
+                    <SourceView
+                      key={pk}
+                      data={filteredBlockPools[pk]}
+                      title={pk}
+                      selectBlock={selectBlock}
+                      gridMinTime={viewMinTime}
+                      gridMaxTime={viewMaxTime}
+                      blockSearch={blockSearch}
+                      compactionLevel={compactionLevel}
+                    />
+                  ))
+                ) : (
+                  <div>
+                    <h3>No Blocks Found!</h3>
+                  </div>
+                )}
               </div>
               <TimeRange
                 gridMinTime={gridMinTime}
@@ -172,7 +184,12 @@ export const BlocksContent: FC<{ data: BlockListProps }> = ({ data }) => {
                 onChange={setViewTime}
               />
             </div>
-            <BlockDetails selectBlock={selectBlock} block={selectedBlock} />
+            <BlockDetails
+              pathPrefix={pathPrefix}
+              selectBlock={selectBlock}
+              block={selectedBlock}
+              disableAdminOperations={disableAdminOperations}
+            />
           </div>
         </>
       ) : (
@@ -197,6 +214,7 @@ export const Blocks: FC<RouteComponentProps & PathPrefixProps & BlocksProps> = (
 
   return (
     <BlocksWithStatusIndicator
+      pathPrefix={pathPrefix}
       data={response.data}
       error={badResponse ? new Error(responseStatus) : error}
       isLoading={isLoading}

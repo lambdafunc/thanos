@@ -6,7 +6,6 @@ package extkingpin
 import (
 	"fmt"
 	"strings"
-	"time"
 
 	extflag "github.com/efficientgo/tools/extkingpin"
 	"github.com/pkg/errors"
@@ -48,10 +47,8 @@ func Addrs(flags *kingpin.FlagClause) (target *addressSlice) {
 	return
 }
 
-// validateAddrs checks an address slice for duplicates and empty or invalid elements.
+// validateAddrs checks an address slice for empty or invalid elements.
 func validateAddrs(addrs addressSlice) error {
-	set := map[string]struct{}{}
-
 	for _, addr := range addrs {
 		if addr == "" {
 			return errors.New("Address is empty.")
@@ -62,44 +59,12 @@ func validateAddrs(addrs addressSlice) error {
 		if len(qtypeAndName) != 2 && len(hostAndPort) != 2 {
 			return errors.Errorf("Address %s is not of <host>:<port> format or a valid DNS query.", addr)
 		}
-
-		if _, ok := set[addr]; ok {
-			return errors.Errorf("Address %s is duplicated.", addr)
-		}
-
-		set[addr] = struct{}{}
 	}
 
 	return nil
 }
 
-// RegisterGRPCFlags registers flags commonly used to configure gRPC servers with.
-func RegisterGRPCFlags(cmd FlagClause) (
-	grpcBindAddr *string,
-	grpcGracePeriod *model.Duration,
-	grpcTLSSrvCert *string,
-	grpcTLSSrvKey *string,
-	grpcTLSSrvClientCA *string,
-	grpcMaxConnectionAge *time.Duration,
-) {
-	grpcBindAddr = cmd.Flag("grpc-address", "Listen ip:port address for gRPC endpoints (StoreAPI). Make sure this address is routable from other components.").
-		Default("0.0.0.0:10901").String()
-	grpcGracePeriod = ModelDuration(cmd.Flag("grpc-grace-period", "Time to wait after an interrupt received for GRPC Server.").Default("2m")) // by default it's the same as query.timeout.
-
-	grpcTLSSrvCert = cmd.Flag("grpc-server-tls-cert", "TLS Certificate for gRPC server, leave blank to disable TLS").Default("").String()
-	grpcTLSSrvKey = cmd.Flag("grpc-server-tls-key", "TLS Key for the gRPC server, leave blank to disable TLS").Default("").String()
-	grpcTLSSrvClientCA = cmd.Flag("grpc-server-tls-client-ca", "TLS CA to verify clients against. If no client CA is specified, there is no client verification on server side. (tls.NoClientCert)").Default("").String()
-	grpcMaxConnectionAge = cmd.Flag("grpc-server-max-connection-age", "The grpc server max connection age. This controls how often to re-read the tls certificates and redo the TLS handshake ").Default("60m").Duration()
-
-	return grpcBindAddr,
-		grpcGracePeriod,
-		grpcTLSSrvCert,
-		grpcTLSSrvKey,
-		grpcTLSSrvClientCA,
-		grpcMaxConnectionAge
-}
-
-// RegisterCommonObjStoreFlags register flags commonly used to configure http servers with.
+// RegisterHTTPFlags register flags commonly used to configure http servers with.
 func RegisterHTTPFlags(cmd FlagClause) (httpBindAddr *string, httpGracePeriod *model.Duration, httpTLSConfig *string) {
 	httpBindAddr = cmd.Flag("http-address", "Listen host:port for HTTP endpoints.").Default("0.0.0.0:10902").String()
 	httpGracePeriod = ModelDuration(cmd.Flag("http-grace-period", "Time to wait after an interrupt received for HTTP Server.").Default("2m")) // by default it's the same as query.timeout.
@@ -136,8 +101,7 @@ func RegisterRequestLoggingFlags(app FlagClause) *extflag.PathOrContent {
 	return extflag.RegisterPathOrContent(
 		app,
 		"request.logging-config",
-		// TODO @yashrsharma44: Change the link with the documented link for yaml configuration.
-		"YAML file with request logging configuration. See format details: https://gist.github.com/yashrsharma44/02f5765c5710dd09ce5d14e854f22825",
+		"YAML file with request logging configuration. See format details: https://thanos.io/tip/thanos/logging.md/#configuration",
 		extflag.WithEnvSubstitution(),
 	)
 }
@@ -147,7 +111,7 @@ func RegisterSelectorRelabelFlags(cmd FlagClause) *extflag.PathOrContent {
 	return extflag.RegisterPathOrContent(
 		cmd,
 		"selector.relabel-config",
-		"YAML file that contains relabeling configuration that allows selecting blocks. It follows native Prometheus relabel-config syntax. See format details: https://prometheus.io/docs/prometheus/latest/configuration/configuration/#relabel_config ",
+		"YAML file with relabeling configuration that allows selecting blocks to act on based on their external labels. It follows thanos sharding relabel-config syntax. For format details see: https://thanos.io/tip/thanos/sharding.md/#relabelling ",
 		extflag.WithEnvSubstitution(),
 	)
 }

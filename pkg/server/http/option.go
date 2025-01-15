@@ -13,6 +13,7 @@ type options struct {
 	listen        string
 	tlsConfigPath string
 	mux           *http.ServeMux
+	enableH2C     bool
 }
 
 // Option overrides behavior of Server.
@@ -48,7 +49,13 @@ func WithTLSConfig(tls string) Option {
 	})
 }
 
-// WithMux overrides the the server's default mux.
+func WithEnableH2C(enableH2C bool) Option {
+	return optionFunc(func(o *options) {
+		o.enableH2C = enableH2C
+	})
+}
+
+// WithMux overrides the server's default mux.
 func WithMux(mux *http.ServeMux) Option {
 	return optionFunc(func(o *options) {
 		o.mux = mux

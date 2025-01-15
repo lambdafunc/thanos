@@ -6,11 +6,12 @@ package block
 import (
 	"context"
 	"encoding/json"
-	"io/ioutil"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,7 +24,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/relabel"
-	"github.com/prometheus/prometheus/tsdb"
+	"github.com/thanos-io/objstore"
 	"golang.org/x/sync/errgroup"
 	"gopkg.in/yaml.v2"
 
@@ -31,11 +32,17 @@ import (
 	"github.com/thanos-io/thanos/pkg/errutil"
 	"github.com/thanos-io/thanos/pkg/extprom"
 	"github.com/thanos-io/thanos/pkg/model"
-	"github.com/thanos-io/thanos/pkg/objstore"
 	"github.com/thanos-io/thanos/pkg/runutil"
 )
 
 const FetcherConcurrency = 32
+
+// BaseFetcherMetrics holds metrics tracked by the base fetcher. This struct and its fields are exported
+// to allow depending projects (eg. Cortex) to implement their own custom metadata fetcher while tracking
+// compatible metrics.
+type BaseFetcherMetrics struct {
+	Syncs prometheus.Counter
+}
 
 // FetcherMetrics holds metrics tracked by the metadata fetcher. This struct and its fields are exported
 // to allow depending projects (eg. Cortex) to implement their own custom metadata fetcher while tracking
@@ -43,7 +50,7 @@ const FetcherConcurrency = 32
 type FetcherMetrics struct {
 	Syncs        prometheus.Counter
 	SyncFailures prometheus.Counter
-	SyncDuration prometheus.Histogram
+	SyncDuration prometheus.Observer
 
 	Synced   *extprom.TxGaugeVec
 	Modified *extprom.TxGaugeVec
@@ -62,7 +69,7 @@ func (s *FetcherMetrics) ResetTx() {
 }
 
 const (
-	fetcherSubSys = "blocks_meta"
+	FetcherSubSys = "blocks_meta"
 
 	CorruptedMeta = "corrupted-meta-json"
 	NoMeta        = "no-meta-json"
@@ -81,25 +88,40 @@ const (
 	// MarkedForNoCompactionMeta is label for blocks which are loaded but also marked for no compaction. This label is also counted in `loaded` label metric.
 	MarkedForNoCompactionMeta = "marked-for-no-compact"
 
+	// MarkedForNoDownsampleMeta is label for blocks which are loaded but also marked for no downsample. This label is also counted in `loaded` label metric.
+	MarkedForNoDownsampleMeta = "marked-for-no-downsample"
+
 	// Modified label values.
 	replicaRemovedMeta = "replica-label-removed"
 )
+
+func NewBaseFetcherMetrics(reg prometheus.Registerer) *BaseFetcherMetrics {
+	var m BaseFetcherMetrics
+
+	m.Syncs = promauto.With(reg).NewCounter(prometheus.CounterOpts{
+		Subsystem: FetcherSubSys,
+		Name:      "base_syncs_total",
+		Help:      "Total blocks metadata synchronization attempts by base Fetcher",
+	})
+
+	return &m
+}
 
 func NewFetcherMetrics(reg prometheus.Registerer, syncedExtraLabels, modifiedExtraLabels [][]string) *FetcherMetrics {
 	var m FetcherMetrics
 
 	m.Syncs = promauto.With(reg).NewCounter(prometheus.CounterOpts{
-		Subsystem: fetcherSubSys,
+		Subsystem: FetcherSubSys,
 		Name:      "syncs_total",
 		Help:      "Total blocks metadata synchronization attempts",
 	})
 	m.SyncFailures = promauto.With(reg).NewCounter(prometheus.CounterOpts{
-		Subsystem: fetcherSubSys,
+		Subsystem: FetcherSubSys,
 		Name:      "sync_failures_total",
 		Help:      "Total blocks metadata synchronization failures",
 	})
 	m.SyncDuration = promauto.With(reg).NewHistogram(prometheus.HistogramOpts{
-		Subsystem: fetcherSubSys,
+		Subsystem: FetcherSubSys,
 		Name:      "sync_duration_seconds",
 		Help:      "Duration of the blocks metadata synchronization in seconds",
 		Buckets:   []float64{0.01, 1, 10, 100, 300, 600, 1000},
@@ -107,37 +129,164 @@ func NewFetcherMetrics(reg prometheus.Registerer, syncedExtraLabels, modifiedExt
 	m.Synced = extprom.NewTxGaugeVec(
 		reg,
 		prometheus.GaugeOpts{
-			Subsystem: fetcherSubSys,
+			Subsystem: FetcherSubSys,
 			Name:      "synced",
 			Help:      "Number of block metadata synced",
 		},
 		[]string{"state"},
-		append([][]string{
-			{CorruptedMeta},
-			{NoMeta},
-			{LoadedMeta},
-			{tooFreshMeta},
-			{FailedMeta},
-			{labelExcludedMeta},
-			{timeExcludedMeta},
-			{duplicateMeta},
-			{MarkedForDeletionMeta},
-			{MarkedForNoCompactionMeta},
-		}, syncedExtraLabels...)...,
+		append(DefaultSyncedStateLabelValues(), syncedExtraLabels...)...,
 	)
 	m.Modified = extprom.NewTxGaugeVec(
 		reg,
 		prometheus.GaugeOpts{
-			Subsystem: fetcherSubSys,
+			Subsystem: FetcherSubSys,
 			Name:      "modified",
 			Help:      "Number of blocks whose metadata changed",
 		},
 		[]string{"modified"},
-		append([][]string{
-			{replicaRemovedMeta},
-		}, modifiedExtraLabels...)...,
+		append(DefaultModifiedLabelValues(), modifiedExtraLabels...)...,
 	)
 	return &m
+}
+
+func DefaultSyncedStateLabelValues() [][]string {
+	return [][]string{
+		{CorruptedMeta},
+		{NoMeta},
+		{LoadedMeta},
+		{tooFreshMeta},
+		{FailedMeta},
+		{labelExcludedMeta},
+		{timeExcludedMeta},
+		{duplicateMeta},
+		{MarkedForDeletionMeta},
+		{MarkedForNoCompactionMeta},
+	}
+}
+
+func DefaultModifiedLabelValues() [][]string {
+	return [][]string{
+		{replicaRemovedMeta},
+	}
+}
+
+// Lister lists block IDs from a bucket.
+type Lister interface {
+	// GetActiveAndPartialBlockIDs GetActiveBlocksIDs returning it via channel (streaming) and response.
+	// Active blocks are blocks which contain meta.json, while partial blocks are blocks without meta.json
+	GetActiveAndPartialBlockIDs(ctx context.Context, ch chan<- ulid.ULID) (partialBlocks map[ulid.ULID]bool, err error)
+}
+
+// RecursiveLister lists block IDs by recursively iterating through a bucket.
+type RecursiveLister struct {
+	logger log.Logger
+	bkt    objstore.InstrumentedBucketReader
+}
+
+func NewRecursiveLister(logger log.Logger, bkt objstore.InstrumentedBucketReader) *RecursiveLister {
+	return &RecursiveLister{
+		logger: logger,
+		bkt:    bkt,
+	}
+}
+
+func (f *RecursiveLister) GetActiveAndPartialBlockIDs(ctx context.Context, ch chan<- ulid.ULID) (partialBlocks map[ulid.ULID]bool, err error) {
+	partialBlocks = make(map[ulid.ULID]bool)
+	err = f.bkt.Iter(ctx, "", func(name string) error {
+		parts := strings.Split(name, "/")
+		dir, file := parts[0], parts[len(parts)-1]
+		id, ok := IsBlockDir(dir)
+		if !ok {
+			return nil
+		}
+		if _, ok := partialBlocks[id]; !ok {
+			partialBlocks[id] = true
+		}
+		if !IsBlockMetaFile(file) {
+			return nil
+		}
+		partialBlocks[id] = false
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case ch <- id:
+		}
+		return nil
+	}, objstore.WithRecursiveIter())
+	return partialBlocks, err
+}
+
+// ConcurrentLister lists block IDs by doing a top level iteration of the bucket
+// followed by one Exists call for each discovered block to detect partial blocks.
+type ConcurrentLister struct {
+	logger log.Logger
+	bkt    objstore.InstrumentedBucketReader
+}
+
+func NewConcurrentLister(logger log.Logger, bkt objstore.InstrumentedBucketReader) *ConcurrentLister {
+	return &ConcurrentLister{
+		logger: logger,
+		bkt:    bkt,
+	}
+}
+
+func (f *ConcurrentLister) GetActiveAndPartialBlockIDs(ctx context.Context, ch chan<- ulid.ULID) (partialBlocks map[ulid.ULID]bool, err error) {
+	const concurrency = 64
+
+	partialBlocks = make(map[ulid.ULID]bool)
+	var (
+		metaChan = make(chan ulid.ULID, concurrency)
+		eg, gCtx = errgroup.WithContext(ctx)
+		mu       sync.Mutex
+	)
+	for i := 0; i < concurrency; i++ {
+		eg.Go(func() error {
+			for uid := range metaChan {
+				// TODO(bwplotka): If that causes problems (obj store rate limits), add longer ttl to cached items.
+				// For 1y and 100 block sources this generates ~1.5-3k HEAD RPM. AWS handles 330k RPM per prefix.
+				// TODO(bwplotka): Consider filtering by consistency delay here (can't do until compactor healthyOverride work).
+				metaFile := path.Join(uid.String(), MetaFilename)
+				ok, err := f.bkt.Exists(gCtx, metaFile)
+				if err != nil {
+					return errors.Wrapf(err, "meta.json file exists: %v", uid)
+				}
+				if !ok {
+					mu.Lock()
+					partialBlocks[uid] = true
+					mu.Unlock()
+					continue
+				}
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case ch <- uid:
+				}
+			}
+			return nil
+		})
+	}
+
+	if err = f.bkt.Iter(ctx, "", func(name string) error {
+		id, ok := IsBlockDir(name)
+		if !ok {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case metaChan <- id:
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	close(metaChan)
+
+	if err := eg.Wait(); err != nil {
+		return nil, err
+	}
+	return partialBlocks, nil
 }
 
 type MetadataFetcher interface {
@@ -145,20 +294,23 @@ type MetadataFetcher interface {
 	UpdateOnChange(func([]metadata.Meta, error))
 }
 
-type MetadataFilter interface {
-	Filter(ctx context.Context, metas map[ulid.ULID]*metadata.Meta, synced *extprom.TxGaugeVec) error
+// GaugeVec hides something like a Prometheus GaugeVec or an extprom.TxGaugeVec.
+type GaugeVec interface {
+	WithLabelValues(lvs ...string) prometheus.Gauge
 }
 
-type MetadataModifier interface {
-	Modify(ctx context.Context, metas map[ulid.ULID]*metadata.Meta, modified *extprom.TxGaugeVec) error
+// Filter allows filtering or modifying metas from the provided map or returns error.
+type MetadataFilter interface {
+	Filter(ctx context.Context, metas map[ulid.ULID]*metadata.Meta, synced GaugeVec, modified GaugeVec) error
 }
 
 // BaseFetcher is a struct that synchronizes filtered metadata of all block in the object storage with the local state.
 // Go-routine safe.
 type BaseFetcher struct {
-	logger      log.Logger
-	concurrency int
-	bkt         objstore.InstrumentedBucketReader
+	logger         log.Logger
+	concurrency    int
+	bkt            objstore.InstrumentedBucketReader
+	blockIDsLister Lister
 
 	// Optional local directory to cache meta.json files.
 	cacheDir string
@@ -170,7 +322,12 @@ type BaseFetcher struct {
 }
 
 // NewBaseFetcher constructs BaseFetcher.
-func NewBaseFetcher(logger log.Logger, concurrency int, bkt objstore.InstrumentedBucketReader, dir string, reg prometheus.Registerer) (*BaseFetcher, error) {
+func NewBaseFetcher(logger log.Logger, concurrency int, bkt objstore.InstrumentedBucketReader, blockIDsFetcher Lister, dir string, reg prometheus.Registerer) (*BaseFetcher, error) {
+	return NewBaseFetcherWithMetrics(logger, concurrency, bkt, blockIDsFetcher, dir, NewBaseFetcherMetrics(reg))
+}
+
+// NewBaseFetcherWithMetrics constructs BaseFetcher.
+func NewBaseFetcherWithMetrics(logger log.Logger, concurrency int, bkt objstore.InstrumentedBucketReader, blockIDsLister Lister, dir string, metrics *BaseFetcherMetrics) (*BaseFetcher, error) {
 	if logger == nil {
 		logger = log.NewNopLogger()
 	}
@@ -184,37 +341,48 @@ func NewBaseFetcher(logger log.Logger, concurrency int, bkt objstore.Instrumente
 	}
 
 	return &BaseFetcher{
-		logger:      log.With(logger, "component", "block.BaseFetcher"),
-		concurrency: concurrency,
-		bkt:         bkt,
-		cacheDir:    cacheDir,
-		cached:      map[ulid.ULID]*metadata.Meta{},
-		syncs: promauto.With(reg).NewCounter(prometheus.CounterOpts{
-			Subsystem: fetcherSubSys,
-			Name:      "base_syncs_total",
-			Help:      "Total blocks metadata synchronization attempts by base Fetcher",
-		}),
+		logger:         log.With(logger, "component", "block.BaseFetcher"),
+		concurrency:    concurrency,
+		bkt:            bkt,
+		blockIDsLister: blockIDsLister,
+		cacheDir:       cacheDir,
+		cached:         map[ulid.ULID]*metadata.Meta{},
+		syncs:          metrics.Syncs,
 	}, nil
 }
 
 // NewRawMetaFetcher returns basic meta fetcher without proper handling for eventual consistent backends or partial uploads.
 // NOTE: Not suitable to use in production.
-func NewRawMetaFetcher(logger log.Logger, bkt objstore.InstrumentedBucketReader) (*MetaFetcher, error) {
-	return NewMetaFetcher(logger, 1, bkt, "", nil, nil, nil)
+func NewRawMetaFetcher(logger log.Logger, bkt objstore.InstrumentedBucketReader, blockIDsFetcher Lister) (*MetaFetcher, error) {
+	return NewMetaFetcher(logger, 1, bkt, blockIDsFetcher, "", nil, nil)
 }
 
 // NewMetaFetcher returns meta fetcher.
-func NewMetaFetcher(logger log.Logger, concurrency int, bkt objstore.InstrumentedBucketReader, dir string, reg prometheus.Registerer, filters []MetadataFilter, modifiers []MetadataModifier) (*MetaFetcher, error) {
-	b, err := NewBaseFetcher(logger, concurrency, bkt, dir, reg)
+func NewMetaFetcher(logger log.Logger, concurrency int, bkt objstore.InstrumentedBucketReader, blockIDsFetcher Lister, dir string, reg prometheus.Registerer, filters []MetadataFilter) (*MetaFetcher, error) {
+	b, err := NewBaseFetcher(logger, concurrency, bkt, blockIDsFetcher, dir, reg)
 	if err != nil {
 		return nil, err
 	}
-	return b.NewMetaFetcher(reg, filters, modifiers), nil
+	return b.NewMetaFetcher(reg, filters), nil
+}
+
+// NewMetaFetcherWithMetrics returns meta fetcher.
+func NewMetaFetcherWithMetrics(logger log.Logger, concurrency int, bkt objstore.InstrumentedBucketReader, blockIDsFetcher Lister, dir string, baseFetcherMetrics *BaseFetcherMetrics, fetcherMetrics *FetcherMetrics, filters []MetadataFilter) (*MetaFetcher, error) {
+	b, err := NewBaseFetcherWithMetrics(logger, concurrency, bkt, blockIDsFetcher, dir, baseFetcherMetrics)
+	if err != nil {
+		return nil, err
+	}
+	return b.NewMetaFetcherWithMetrics(fetcherMetrics, filters), nil
 }
 
 // NewMetaFetcher transforms BaseFetcher into actually usable *MetaFetcher.
-func (f *BaseFetcher) NewMetaFetcher(reg prometheus.Registerer, filters []MetadataFilter, modifiers []MetadataModifier, logTags ...interface{}) *MetaFetcher {
-	return &MetaFetcher{metrics: NewFetcherMetrics(reg, nil, nil), wrapped: f, filters: filters, modifiers: modifiers, logger: log.With(f.logger, logTags...)}
+func (f *BaseFetcher) NewMetaFetcher(reg prometheus.Registerer, filters []MetadataFilter, logTags ...interface{}) *MetaFetcher {
+	return f.NewMetaFetcherWithMetrics(NewFetcherMetrics(reg, nil, nil), filters, logTags...)
+}
+
+// NewMetaFetcherWithMetrics transforms BaseFetcher into actually usable *MetaFetcher.
+func (f *BaseFetcher) NewMetaFetcherWithMetrics(fetcherMetrics *FetcherMetrics, filters []MetadataFilter, logTags ...interface{}) *MetaFetcher {
+	return &MetaFetcher{metrics: fetcherMetrics, wrapped: f, filters: filters, logger: log.With(f.logger, logTags...)}
 }
 
 var (
@@ -229,17 +397,6 @@ func (f *BaseFetcher) loadMeta(ctx context.Context, id ulid.ULID) (*metadata.Met
 		metaFile       = path.Join(id.String(), MetaFilename)
 		cachedBlockDir = filepath.Join(f.cacheDir, id.String())
 	)
-
-	// TODO(bwplotka): If that causes problems (obj store rate limits), add longer ttl to cached items.
-	// For 1y and 100 block sources this generates ~1.5-3k HEAD RPM. AWS handles 330k RPM per prefix.
-	// TODO(bwplotka): Consider filtering by consistency delay here (can't do until compactor healthyOverride work).
-	ok, err := f.bkt.Exists(ctx, metaFile)
-	if err != nil {
-		return nil, errors.Wrapf(err, "meta.json file exists: %v", metaFile)
-	}
-	if !ok {
-		return nil, ErrorSyncMetaNotFound
-	}
 
 	if m, seen := f.cached[id]; seen {
 		return m, nil
@@ -271,7 +428,7 @@ func (f *BaseFetcher) loadMeta(ctx context.Context, id ulid.ULID) (*metadata.Met
 
 	defer runutil.CloseWithLogOnErr(f.logger, r, "close bkt meta get")
 
-	metaContent, err := ioutil.ReadAll(r)
+	metaContent, err := io.ReadAll(r)
 	if err != nil {
 		return nil, errors.Wrapf(err, "read meta file: %v", metaFile)
 	}
@@ -356,28 +513,27 @@ func (f *BaseFetcher) fetchMetadata(ctx context.Context) (interface{}, error) {
 		})
 	}
 
+	var partialBlocks map[ulid.ULID]bool
+	var err error
 	// Workers scheduled, distribute blocks.
 	eg.Go(func() error {
 		defer close(ch)
-		return f.bkt.Iter(ctx, "", func(name string) error {
-			id, ok := IsBlockDir(name)
-			if !ok {
-				return nil
-			}
-
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case ch <- id:
-			}
-
-			return nil
-		})
+		partialBlocks, err = f.blockIDsLister.GetActiveAndPartialBlockIDs(ctx, ch)
+		return err
 	})
 
 	if err := eg.Wait(); err != nil {
 		return nil, errors.Wrap(err, "BaseFetcher: iter bucket")
 	}
+
+	mtx.Lock()
+	for blockULID, isPartial := range partialBlocks {
+		if isPartial {
+			resp.partial[blockULID] = errors.Errorf("block %s has no meta file", blockULID)
+			resp.noMetas++
+		}
+	}
+	mtx.Unlock()
 
 	if len(resp.metaErrs) > 0 {
 		return resp, nil
@@ -395,7 +551,7 @@ func (f *BaseFetcher) fetchMetadata(ctx context.Context) (interface{}, error) {
 
 	// Best effort cleanup of disk-cached metas.
 	if f.cacheDir != "" {
-		fis, err := ioutil.ReadDir(f.cacheDir)
+		fis, err := os.ReadDir(f.cacheDir)
 		names := make([]string, 0, len(fis))
 		for _, fi := range fis {
 			names = append(names, fi.Name())
@@ -425,7 +581,7 @@ func (f *BaseFetcher) fetchMetadata(ctx context.Context) (interface{}, error) {
 	return resp, nil
 }
 
-func (f *BaseFetcher) fetch(ctx context.Context, metrics *FetcherMetrics, filters []MetadataFilter, modifiers []MetadataModifier) (_ map[ulid.ULID]*metadata.Meta, _ map[ulid.ULID]error, err error) {
+func (f *BaseFetcher) fetch(ctx context.Context, metrics *FetcherMetrics, filters []MetadataFilter) (_ map[ulid.ULID]*metadata.Meta, _ map[ulid.ULID]error, err error) {
 	start := time.Now()
 	defer func() {
 		metrics.SyncDuration.Observe(time.Since(start).Seconds())
@@ -433,8 +589,6 @@ func (f *BaseFetcher) fetch(ctx context.Context, metrics *FetcherMetrics, filter
 			metrics.SyncFailures.Inc()
 		}
 	}()
-	metrics.Syncs.Inc()
-	metrics.ResetTx()
 
 	// Run this in thread safe run group.
 	// TODO(bwplotka): Consider custom singleflight with ttl.
@@ -459,20 +613,12 @@ func (f *BaseFetcher) fetch(ctx context.Context, metrics *FetcherMetrics, filter
 
 	for _, filter := range filters {
 		// NOTE: filter can update synced metric accordingly to the reason of the exclude.
-		if err := filter.Filter(ctx, metas, metrics.Synced); err != nil {
+		if err := filter.Filter(ctx, metas, metrics.Synced, metrics.Modified); err != nil {
 			return nil, nil, errors.Wrap(err, "filter metas")
 		}
 	}
 
-	for _, m := range modifiers {
-		// NOTE: modifier can update modified metric accordingly to the reason of the modification.
-		if err := m.Modify(ctx, metas, metrics.Modified); err != nil {
-			return nil, nil, errors.Wrap(err, "modify metas")
-		}
-	}
-
 	metrics.Synced.WithLabelValues(LoadedMeta).Set(float64(len(metas)))
-	metrics.Submit()
 
 	if len(resp.metaErrs) > 0 {
 		return metas, resp.partial, errors.Wrap(resp.metaErrs.Err(), "incomplete view")
@@ -493,8 +639,7 @@ type MetaFetcher struct {
 	wrapped *BaseFetcher
 	metrics *FetcherMetrics
 
-	filters   []MetadataFilter
-	modifiers []MetadataModifier
+	filters []MetadataFilter
 
 	listener func([]metadata.Meta, error)
 
@@ -506,7 +651,10 @@ type MetaFetcher struct {
 //
 // Returned error indicates a failure in fetching metadata. Returned meta can be assumed as correct, with some blocks missing.
 func (f *MetaFetcher) Fetch(ctx context.Context) (metas map[ulid.ULID]*metadata.Meta, partial map[ulid.ULID]error, err error) {
-	metas, partial, err = f.wrapped.fetch(ctx, f.metrics, f.filters, f.modifiers)
+	f.metrics.Syncs.Inc()
+	f.metrics.ResetTx()
+
+	metas, partial, err = f.wrapped.fetch(ctx, f.metrics, f.filters)
 	if f.listener != nil {
 		blocks := make([]metadata.Meta, 0, len(metas))
 		for _, meta := range metas {
@@ -514,6 +662,8 @@ func (f *MetaFetcher) Fetch(ctx context.Context) (metas map[ulid.ULID]*metadata.
 		}
 		f.listener(blocks, err)
 	}
+
+	f.metrics.Submit()
 	return metas, partial, err
 }
 
@@ -536,7 +686,7 @@ func NewTimePartitionMetaFilter(MinTime, MaxTime model.TimeOrDurationValue) *Tim
 }
 
 // Filter filters out blocks that are outside of specified time range.
-func (f *TimePartitionMetaFilter) Filter(_ context.Context, metas map[ulid.ULID]*metadata.Meta, synced *extprom.TxGaugeVec) error {
+func (f *TimePartitionMetaFilter) Filter(_ context.Context, metas map[ulid.ULID]*metadata.Meta, synced GaugeVec, modified GaugeVec) error {
 	for id, m := range metas {
 		if m.MaxTime >= f.minTime.PrometheusTimestamp() && m.MinTime <= f.maxTime.PrometheusTimestamp() {
 			continue
@@ -564,16 +714,17 @@ func NewLabelShardedMetaFilter(relabelConfig []*relabel.Config) *LabelShardedMet
 const BlockIDLabel = "__block_id"
 
 // Filter filters out blocks that have no labels after relabelling of each block external (Thanos) labels.
-func (f *LabelShardedMetaFilter) Filter(_ context.Context, metas map[ulid.ULID]*metadata.Meta, synced *extprom.TxGaugeVec) error {
-	var lbls labels.Labels
+func (f *LabelShardedMetaFilter) Filter(_ context.Context, metas map[ulid.ULID]*metadata.Meta, synced GaugeVec, modified GaugeVec) error {
+	var b labels.Builder
 	for id, m := range metas {
-		lbls = lbls[:0]
-		lbls = append(lbls, labels.Label{Name: BlockIDLabel, Value: id.String()})
+		b.Reset(labels.EmptyLabels())
+		b.Set(BlockIDLabel, id.String())
+
 		for k, v := range m.Thanos.Labels {
-			lbls = append(lbls, labels.Label{Name: k, Value: v})
+			b.Set(k, v)
 		}
 
-		if processedLabels := relabel.Process(lbls, f.relabelConfig...); len(processedLabels) == 0 {
+		if processedLabels, _ := relabel.Process(b.Labels(), f.relabelConfig...); processedLabels.IsEmpty() {
 			synced.WithLabelValues(labelExcludedMeta).Inc()
 			delete(metas, id)
 		}
@@ -581,51 +732,60 @@ func (f *LabelShardedMetaFilter) Filter(_ context.Context, metas map[ulid.ULID]*
 	return nil
 }
 
-var _ MetadataFilter = &DeduplicateFilter{}
+var _ MetadataFilter = &DefaultDeduplicateFilter{}
 
-// DeduplicateFilter is a BaseFetcher filter that filters out older blocks that have exactly the same data.
+type DeduplicateFilter interface {
+	DuplicateIDs() []ulid.ULID
+}
+
+// DefaultDeduplicateFilter is a BaseFetcher filter that filters out older blocks that have exactly the same data.
 // Not go-routine safe.
-type DeduplicateFilter struct {
+type DefaultDeduplicateFilter struct {
 	duplicateIDs []ulid.ULID
+	concurrency  int
 	mu           sync.Mutex
 }
 
-// NewDeduplicateFilter creates DeduplicateFilter.
-func NewDeduplicateFilter() *DeduplicateFilter {
-	return &DeduplicateFilter{}
+// NewDeduplicateFilter creates DefaultDeduplicateFilter.
+func NewDeduplicateFilter(concurrency int) *DefaultDeduplicateFilter {
+	return &DefaultDeduplicateFilter{concurrency: concurrency}
 }
 
 // Filter filters out duplicate blocks that can be formed
 // from two or more overlapping blocks that fully submatches the source blocks of the older blocks.
-func (f *DeduplicateFilter) Filter(_ context.Context, metas map[ulid.ULID]*metadata.Meta, synced *extprom.TxGaugeVec) error {
+func (f *DefaultDeduplicateFilter) Filter(_ context.Context, metas map[ulid.ULID]*metadata.Meta, synced GaugeVec, modified GaugeVec) error {
 	f.duplicateIDs = f.duplicateIDs[:0]
 
 	var wg sync.WaitGroup
+	var groupChan = make(chan []*metadata.Meta)
 
-	metasByResolution := make(map[int64][]*metadata.Meta)
-	for _, meta := range metas {
-		res := meta.Thanos.Downsample.Resolution
-		metasByResolution[res] = append(metasByResolution[res], meta)
-	}
-
-	for res := range metasByResolution {
+	// Start up workers to deduplicate workgroups when they're ready.
+	for i := 0; i < f.concurrency; i++ {
 		wg.Add(1)
-		go func(res int64) {
+		go func() {
 			defer wg.Done()
-			f.filterForResolution(NewNode(&metadata.Meta{
-				BlockMeta: tsdb.BlockMeta{
-					ULID: ulid.MustNew(uint64(0), nil),
-				},
-			}), metasByResolution[res], metas, synced)
-		}(res)
+			for group := range groupChan {
+				f.filterGroup(group, metas, synced)
+			}
+		}()
 	}
 
+	// We need only look within a compaction group for duplicates, so splitting by group key gives us parallelizable streams.
+	metasByCompactionGroup := make(map[string][]*metadata.Meta)
+	for _, meta := range metas {
+		groupKey := meta.Thanos.GroupKey()
+		metasByCompactionGroup[groupKey] = append(metasByCompactionGroup[groupKey], meta)
+	}
+	for _, group := range metasByCompactionGroup {
+		groupChan <- group
+	}
+	close(groupChan)
 	wg.Wait()
 
 	return nil
 }
 
-func (f *DeduplicateFilter) filterForResolution(root *Node, metaSlice []*metadata.Meta, metas map[ulid.ULID]*metadata.Meta, synced *extprom.TxGaugeVec) {
+func (f *DefaultDeduplicateFilter) filterGroup(metaSlice []*metadata.Meta, metas map[ulid.ULID]*metadata.Meta, synced GaugeVec) {
 	sort.Slice(metaSlice, func(i, j int) bool {
 		ilen := len(metaSlice[i].Compaction.Sources)
 		jlen := len(metaSlice[j].Compaction.Sources)
@@ -637,53 +797,39 @@ func (f *DeduplicateFilter) filterForResolution(root *Node, metaSlice []*metadat
 		return ilen-jlen > 0
 	})
 
-	for _, meta := range metaSlice {
-		addNodeBySources(root, NewNode(meta))
+	var coveringSet []*metadata.Meta
+	var duplicates []ulid.ULID
+childLoop:
+	for _, child := range metaSlice {
+		childSources := child.Compaction.Sources
+		for _, parent := range coveringSet {
+			parentSources := parent.Compaction.Sources
+
+			// child's sources are present in parent's sources, filter it out.
+			if contains(parentSources, childSources) {
+				duplicates = append(duplicates, child.ULID)
+				continue childLoop
+			}
+		}
+
+		// Child's sources not covered by any member of coveringSet, add it to coveringSet.
+		coveringSet = append(coveringSet, child)
 	}
 
-	duplicateULIDs := getNonRootIDs(root)
-	for _, id := range duplicateULIDs {
-		f.mu.Lock()
-		if metas[id] != nil {
-			f.duplicateIDs = append(f.duplicateIDs, id)
+	f.mu.Lock()
+	for _, duplicate := range duplicates {
+		if metas[duplicate] != nil {
+			f.duplicateIDs = append(f.duplicateIDs, duplicate)
 		}
 		synced.WithLabelValues(duplicateMeta).Inc()
-		delete(metas, id)
-		f.mu.Unlock()
+		delete(metas, duplicate)
 	}
+	f.mu.Unlock()
 }
 
-// DuplicateIDs returns slice of block ids that are filtered out by DeduplicateFilter.
-func (f *DeduplicateFilter) DuplicateIDs() []ulid.ULID {
+// DuplicateIDs returns slice of block ids that are filtered out by DefaultDeduplicateFilter.
+func (f *DefaultDeduplicateFilter) DuplicateIDs() []ulid.ULID {
 	return f.duplicateIDs
-}
-
-func addNodeBySources(root, add *Node) bool {
-	var rootNode *Node
-	childSources := add.Compaction.Sources
-	for _, node := range root.Children {
-		parentSources := node.Compaction.Sources
-
-		// Block exists with same sources, add as child.
-		if contains(parentSources, childSources) && contains(childSources, parentSources) {
-			node.Children = append(node.Children, add)
-			return true
-		}
-
-		// Block's sources are present in other block's sources, add as child.
-		if contains(parentSources, childSources) {
-			rootNode = node
-			break
-		}
-	}
-
-	// Block cannot be attached to any child nodes, add it as child of root.
-	if rootNode == nil {
-		root.Children = append(root.Children, add)
-		return true
-	}
-
-	return addNodeBySources(rootNode, add)
 }
 
 func contains(s1, s2 []ulid.ULID) bool {
@@ -702,9 +848,9 @@ func contains(s1, s2 []ulid.ULID) bool {
 	return true
 }
 
-var _ MetadataModifier = &ReplicaLabelRemover{}
+var _ MetadataFilter = &ReplicaLabelRemover{}
 
-// ReplicaLabelRemover is a BaseFetcher modifier modifies external labels of existing blocks, it removes given replica labels from the metadata of blocks that have it.
+// ReplicaLabelRemover is a BaseFetcher filter that modifies external labels of existing blocks, it removes given replica labels from the metadata of blocks that have it.
 type ReplicaLabelRemover struct {
 	logger log.Logger
 
@@ -716,12 +862,13 @@ func NewReplicaLabelRemover(logger log.Logger, replicaLabels []string) *ReplicaL
 	return &ReplicaLabelRemover{logger: logger, replicaLabels: replicaLabels}
 }
 
-// Modify modifies external labels of existing blocks, it removes given replica labels from the metadata of blocks that have it.
-func (r *ReplicaLabelRemover) Modify(_ context.Context, metas map[ulid.ULID]*metadata.Meta, modified *extprom.TxGaugeVec) error {
+// Filter modifies external labels of existing blocks, it removes given replica labels from the metadata of blocks that have it.
+func (r *ReplicaLabelRemover) Filter(_ context.Context, metas map[ulid.ULID]*metadata.Meta, synced GaugeVec, modified GaugeVec) error {
 	if len(r.replicaLabels) == 0 {
 		return nil
 	}
 
+	countReplicaLabelRemoved := make(map[string]int, len(metas))
 	for u, meta := range metas {
 		l := make(map[string]string)
 		for n, v := range meta.Thanos.Labels {
@@ -730,8 +877,8 @@ func (r *ReplicaLabelRemover) Modify(_ context.Context, metas map[ulid.ULID]*met
 
 		for _, replicaLabel := range r.replicaLabels {
 			if _, exists := l[replicaLabel]; exists {
-				level.Debug(r.logger).Log("msg", "replica label removed", "label", replicaLabel)
 				delete(l, replicaLabel)
+				countReplicaLabelRemoved[replicaLabel] += 1
 				modified.WithLabelValues(replicaRemovedMeta).Inc()
 			}
 		}
@@ -743,6 +890,9 @@ func (r *ReplicaLabelRemover) Modify(_ context.Context, metas map[ulid.ULID]*met
 		nm := *meta
 		nm.Thanos.Labels = l
 		metas[u] = &nm
+	}
+	for replicaLabelRemoved, count := range countReplicaLabelRemoved {
+		level.Debug(r.logger).Log("msg", "removed replica label", "label", replicaLabelRemoved, "count", count)
 	}
 	return nil
 }
@@ -756,15 +906,21 @@ type ConsistencyDelayMetaFilter struct {
 
 // NewConsistencyDelayMetaFilter creates ConsistencyDelayMetaFilter.
 func NewConsistencyDelayMetaFilter(logger log.Logger, consistencyDelay time.Duration, reg prometheus.Registerer) *ConsistencyDelayMetaFilter {
-	if logger == nil {
-		logger = log.NewNopLogger()
-	}
 	_ = promauto.With(reg).NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "consistency_delay_seconds",
 		Help: "Configured consistency delay in seconds.",
 	}, func() float64 {
 		return consistencyDelay.Seconds()
 	})
+
+	return NewConsistencyDelayMetaFilterWithoutMetrics(logger, consistencyDelay)
+}
+
+// NewConsistencyDelayMetaFilterWithoutMetrics creates ConsistencyDelayMetaFilter.
+func NewConsistencyDelayMetaFilterWithoutMetrics(logger log.Logger, consistencyDelay time.Duration) *ConsistencyDelayMetaFilter {
+	if logger == nil {
+		logger = log.NewNopLogger()
+	}
 
 	return &ConsistencyDelayMetaFilter{
 		logger:           logger,
@@ -773,7 +929,7 @@ func NewConsistencyDelayMetaFilter(logger log.Logger, consistencyDelay time.Dura
 }
 
 // Filter filters out blocks that filters blocks that have are created before a specified consistency delay.
-func (f *ConsistencyDelayMetaFilter) Filter(_ context.Context, metas map[ulid.ULID]*metadata.Meta, synced *extprom.TxGaugeVec) error {
+func (f *ConsistencyDelayMetaFilter) Filter(_ context.Context, metas map[ulid.ULID]*metadata.Meta, synced GaugeVec, modified GaugeVec) error {
 	for id, meta := range metas {
 		// TODO(khyatisoneji): Remove the checks about Thanos Source
 		//  by implementing delete delay to fetch metas.
@@ -831,7 +987,7 @@ func (f *IgnoreDeletionMarkFilter) DeletionMarkBlocks() map[ulid.ULID]*metadata.
 
 // Filter filters out blocks that are marked for deletion after a given delay.
 // It also returns the blocks that can be deleted since they were uploaded delay duration before current time.
-func (f *IgnoreDeletionMarkFilter) Filter(ctx context.Context, metas map[ulid.ULID]*metadata.Meta, synced *extprom.TxGaugeVec) error {
+func (f *IgnoreDeletionMarkFilter) Filter(ctx context.Context, metas map[ulid.ULID]*metadata.Meta, synced GaugeVec, modified GaugeVec) error {
 	deletionMarkMap := make(map[ulid.ULID]*metadata.DeletionMark)
 
 	// Make a copy of block IDs to check, in order to avoid concurrency issues

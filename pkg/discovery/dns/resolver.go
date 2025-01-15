@@ -108,7 +108,9 @@ func (s *dnsSD) Resolve(ctx context.Context, name string, qtype QType) ([]string
 			}
 
 			if qtype == SRVNoA {
-				res = append(res, appendScheme(scheme, net.JoinHostPort(rec.Target, resPort)))
+				// Remove the final dot from rooted DNS names (this is for compatibility with Prometheus)
+				target := strings.TrimRight(rec.Target, ".")
+				res = append(res, appendScheme(scheme, net.JoinHostPort(target, resPort)))
 				continue
 			}
 			// Do A lookup for the domain in SRV answer.
@@ -118,7 +120,7 @@ func (s *dnsSD) Resolve(ctx context.Context, name string, qtype QType) ([]string
 					return nil, errors.Wrapf(err, "lookup IP addresses %q", host)
 				}
 				if len(resIPs) == 0 {
-					level.Error(s.logger).Log("msg", "failed to lookup IP addresses", "host", host, "err", err)
+					level.Error(s.logger).Log("msg", "failed to lookup IP addresses", "srv", host, "a", rec.Target, "err", err)
 				}
 			}
 			for _, resIP := range resIPs {

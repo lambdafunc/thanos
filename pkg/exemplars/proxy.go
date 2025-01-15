@@ -6,6 +6,7 @@ package exemplars
 import (
 	"context"
 	"io"
+	"strings"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -18,6 +19,8 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/thanos-io/thanos/pkg/exemplars/exemplarspb"
+	"github.com/thanos-io/thanos/pkg/extpromql"
+	"github.com/thanos-io/thanos/pkg/store"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/thanos-io/thanos/pkg/tracing"
 )
@@ -57,7 +60,7 @@ func (s *Proxy) Exemplars(req *exemplarspb.ExemplarsRequest, srv exemplarspb.Exe
 	span, ctx := tracing.StartSpan(srv.Context(), "proxy_exemplars")
 	defer span.Finish()
 
-	expr, err := parser.ParseExpr(req.Query)
+	expr, err := extpromql.ParseExpr(req.Query)
 	if err != nil {
 		return err
 	}
@@ -79,44 +82,40 @@ func (s *Proxy) Exemplars(req *exemplarspb.ExemplarsRequest, srv exemplarspb.Exe
 		exemplars []*exemplarspb.ExemplarData
 	)
 
+	queryParts := make([]string, 0)
+	labelMatchers := make([]string, 0)
 	for _, st := range s.exemplars() {
-		query := ""
-	Matchers:
-		for _, matchers := range selectors {
-			metricsSelector := ""
-			for _, m := range matchers {
-				for _, ls := range st.LabelSets {
-					if lv := ls.Get(m.Name); lv != "" {
-						if !m.Matches(lv) {
-							continue Matchers
-						} else {
-							// If the current matcher matches one external label,
-							// we don't add it to the current metric selector
-							// as Prometheus' Exemplars API cannot handle external labels.
-							continue
-						}
-					}
-					if metricsSelector == "" {
-						metricsSelector += m.String()
-					} else {
-						metricsSelector += ", " + m.String()
-					}
+		queryParts = queryParts[:0]
+
+		for _, matcherSet := range selectors {
+			extLbls := st.LabelSets
+			if !store.LabelSetsMatch(matcherSet, extLbls...) {
+				continue
+			}
+
+			labelMatchers = labelMatchers[:0]
+			for _, m := range matcherSet {
+				if containsLabelName(m.Name, extLbls) {
+					// If the current matcher matches one external label,
+					// we don't add it to the current metric selector
+					// as Prometheus' Exemplars API cannot handle external labels.
+					continue
 				}
+				labelMatchers = append(labelMatchers, m.String())
 			}
-			// Construct the query by concatenating metric selectors with '+'.
-			// We cannot preserve the original query info, but the returned
-			// results are the same.
-			if query == "" {
-				query += "{" + metricsSelector + "}"
-			} else {
-				query += " + {" + metricsSelector + "}"
-			}
+
+			queryParts = append(queryParts, "{"+strings.Join(labelMatchers, ", ")+"}")
 		}
 
 		// No matchers match this store.
-		if query == "" {
+		if len(queryParts) == 0 {
 			continue
 		}
+
+		// Construct the query by concatenating metric selectors with '+'.
+		// We cannot preserve the original query info, but the returned
+		// results are the same.
+		query := strings.Join(queryParts, "+")
 		r := &exemplarspb.ExemplarsRequest{
 			Start:                   req.Start,
 			End:                     req.End,
@@ -158,6 +157,15 @@ func (s *Proxy) Exemplars(req *exemplarspb.ExemplarsRequest, srv exemplarspb.Exe
 	}
 
 	return nil
+}
+
+func containsLabelName(name string, sets []labels.Labels) bool {
+	for _, ls := range sets {
+		if ls.Get(name) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func (stream *exemplarsStream) receive(ctx context.Context) error {
@@ -214,7 +222,7 @@ func (stream *exemplarsStream) receive(ctx context.Context) error {
 // matchesExternalLabels returns false if given matchers are not matching external labels.
 // If true, matchesExternalLabels also returns Prometheus matchers without those matching external labels.
 func matchesExternalLabels(ms []*labels.Matcher, externalLabels labels.Labels) (bool, []*labels.Matcher) {
-	if len(externalLabels) == 0 {
+	if externalLabels.IsEmpty() {
 		return true, ms
 	}
 

@@ -10,10 +10,12 @@ import (
 
 	"github.com/pkg/errors"
 
-	"github.com/thanos-io/thanos/pkg/testutil"
+	"github.com/efficientgo/core/testutil"
 )
 
 func TestByteRanges_contiguous(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		ranges   byteRanges
 		expected bool
@@ -42,6 +44,8 @@ func TestByteRanges_contiguous(t *testing.T) {
 }
 
 func TestReadByteRanges(t *testing.T) {
+	t.Parallel()
+
 	tests := map[string]struct {
 		src          []byte
 		ranges       byteRanges

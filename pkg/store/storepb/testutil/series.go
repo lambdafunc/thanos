@@ -15,17 +15,24 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cespare/xxhash/v2"
+	"github.com/efficientgo/core/testutil"
+	"github.com/go-kit/log"
 	"github.com/gogo/protobuf/types"
+	"github.com/oklog/ulid"
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/chunks"
 	"github.com/prometheus/prometheus/tsdb/index"
-	"github.com/prometheus/prometheus/tsdb/wal"
+	"github.com/prometheus/prometheus/tsdb/wlog"
+	"go.uber.org/atomic"
 
 	"github.com/thanos-io/thanos/pkg/store/hintspb"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
-	"github.com/thanos-io/thanos/pkg/testutil"
 )
 
 const (
@@ -33,9 +40,9 @@ const (
 	LabelLongSuffix = "aaaaaaaaaabbbbbbbbbbccccccccccdddddddddd"
 )
 
-func allPostings(t testing.TB, ix tsdb.IndexReader) index.Postings {
+func allPostings(ctx context.Context, t testing.TB, ix tsdb.IndexReader) index.Postings {
 	k, v := index.AllPostingsKey()
-	p, err := ix.Postings(k, v)
+	p, err := ix.Postings(ctx, k, v)
 	testutil.Ok(t, err)
 	return p
 }
@@ -48,8 +55,23 @@ type HeadGenOptions struct {
 	WithWAL       bool
 	PrependLabels labels.Labels
 	SkipChunks    bool // Skips chunks in returned slice (not in generated head!).
+	SampleType    chunkenc.ValueType
 
 	Random *rand.Rand
+}
+
+func CreateBlockFromHead(t testing.TB, dir string, head *tsdb.Head) ulid.ULID {
+	compactor, err := tsdb.NewLeveledCompactor(context.Background(), nil, log.NewNopLogger(), []int64{1000000}, nil, nil)
+	testutil.Ok(t, err)
+
+	testutil.Ok(t, os.MkdirAll(dir, 0777))
+
+	// Add +1 millisecond to block maxt because block intervals are half-open: [b.MinTime, b.MaxTime).
+	// Because of this block intervals are always +1 than the total samples it includes.
+	ulids, err := compactor.Write(dir, head, head.MinTime(), head.MaxTime()+1, nil)
+	testutil.Ok(t, err)
+	testutil.Assert(t, len(ulids) > 0)
+	return ulids[0]
 }
 
 // CreateHeadWithSeries returns head filled with given samples and same series returned in separate list for assertion purposes.
@@ -63,6 +85,10 @@ func CreateHeadWithSeries(t testing.TB, j int, opts HeadGenOptions) (*tsdb.Head,
 	if opts.ScrapeInterval == 0 {
 		opts.ScrapeInterval = 1 * time.Millisecond
 	}
+	// Use float type if sample type is not set.
+	if opts.SampleType == chunkenc.ValNone {
+		opts.SampleType = chunkenc.ValFloat
+	}
 
 	fmt.Printf(
 		"Creating %d %d-sample series with %s interval in %s\n",
@@ -72,10 +98,10 @@ func CreateHeadWithSeries(t testing.TB, j int, opts HeadGenOptions) (*tsdb.Head,
 		opts.TSDBDir,
 	)
 
-	var w *wal.WAL
+	var w *wlog.WL
 	var err error
 	if opts.WithWAL {
-		w, err = wal.New(nil, nil, filepath.Join(opts.TSDBDir, "wal"), true)
+		w, err = wlog.New(nil, nil, filepath.Join(opts.TSDBDir, "wal"), wlog.ParseCompressionType(true, string(wlog.CompressionSnappy)))
 		testutil.Ok(t, err)
 	} else {
 		testutil.Ok(t, os.MkdirAll(filepath.Join(opts.TSDBDir, "wal"), os.ModePerm))
@@ -83,27 +109,28 @@ func CreateHeadWithSeries(t testing.TB, j int, opts HeadGenOptions) (*tsdb.Head,
 
 	headOpts := tsdb.DefaultHeadOptions()
 	headOpts.ChunkDirRoot = opts.TSDBDir
-	h, err := tsdb.NewHead(nil, nil, w, headOpts, nil)
+	headOpts.EnableNativeHistograms = *atomic.NewBool(true)
+	h, err := tsdb.NewHead(nil, nil, w, nil, headOpts, nil)
 	testutil.Ok(t, err)
 
 	app := h.Appender(context.Background())
 	for i := 0; i < opts.Series; i++ {
 		tsLabel := j*opts.Series*opts.SamplesPerSeries + i*opts.SamplesPerSeries
-		ref, err := app.Append(
-			0,
-			labels.FromStrings("foo", "bar", "i", fmt.Sprintf("%07d%s", tsLabel, LabelLongSuffix)),
-			int64(tsLabel)*opts.ScrapeInterval.Milliseconds(),
-			opts.Random.Float64(),
-		)
-		testutil.Ok(t, err)
-
-		for is := 1; is < opts.SamplesPerSeries; is++ {
-			_, err := app.Append(ref, nil, int64(tsLabel+is)*opts.ScrapeInterval.Milliseconds(), opts.Random.Float64())
-			testutil.Ok(t, err)
+		switch opts.SampleType {
+		case chunkenc.ValFloat:
+			appendFloatSamples(t, app, tsLabel, opts)
+		case chunkenc.ValHistogram:
+			appendHistogramSamples(t, app, tsLabel, opts)
+		case chunkenc.ValFloatHistogram:
+			appendFloatHistogramSamples(t, app, tsLabel, opts)
 		}
 	}
 	testutil.Ok(t, app.Commit())
 
+	return h, ReadSeriesFromBlock(t, h, opts.PrependLabels, opts.SkipChunks)
+}
+
+func ReadSeriesFromBlock(t testing.TB, h tsdb.BlockReader, extLabels labels.Labels, skipChunks bool) []*storepb.Series {
 	// Use TSDB and get all series for assertion.
 	chks, err := h.Chunks()
 	testutil.Ok(t, err)
@@ -114,22 +141,25 @@ func CreateHeadWithSeries(t testing.TB, j int, opts HeadGenOptions) (*tsdb.Head,
 	defer func() { testutil.Ok(t, ir.Close()) }()
 
 	var (
-		lset       labels.Labels
 		chunkMetas []chunks.Meta
-		expected   = make([]*storepb.Series, 0, opts.Series)
+		expected   = make([]*storepb.Series, 0)
 	)
 
-	all := allPostings(t, ir)
-	for all.Next() {
-		testutil.Ok(t, ir.Series(all.At(), &lset, &chunkMetas))
-		expected = append(expected, &storepb.Series{Labels: labelpb.ZLabelsFromPromLabels(append(opts.PrependLabels.Copy(), lset...))})
+	var builder labels.ScratchBuilder
 
-		if opts.SkipChunks {
+	all := allPostings(context.TODO(), t, ir)
+	for all.Next() {
+		testutil.Ok(t, ir.Series(all.At(), &builder, &chunkMetas))
+		lset := labelpb.ExtendSortedLabels(builder.Labels(), extLabels)
+		expected = append(expected, &storepb.Series{Labels: labelpb.ZLabelsFromPromLabels(lset)})
+
+		if skipChunks {
 			continue
 		}
 
 		for _, c := range chunkMetas {
-			chEnc, err := chks.Chunk(c.Ref)
+			// Ignore iterable as it happens in OOOHead only.
+			chEnc, _, err := chks.ChunkOrIterable(c)
 			testutil.Ok(t, err)
 
 			// Open Chunk.
@@ -140,12 +170,93 @@ func CreateHeadWithSeries(t testing.TB, j int, opts HeadGenOptions) (*tsdb.Head,
 			expected[len(expected)-1].Chunks = append(expected[len(expected)-1].Chunks, storepb.AggrChunk{
 				MinTime: c.MinTime,
 				MaxTime: c.MaxTime,
-				Raw:     &storepb.Chunk{Type: storepb.Chunk_XOR, Data: chEnc.Bytes()},
+				Raw: &storepb.Chunk{
+					Data: chEnc.Bytes(),
+					Type: storepb.Chunk_Encoding(chEnc.Encoding() - 1),
+					Hash: xxhash.Sum64(chEnc.Bytes()),
+				},
 			})
 		}
 	}
 	testutil.Ok(t, all.Err())
-	return h, expected
+	return expected
+}
+
+func appendFloatSamples(t testing.TB, app storage.Appender, tsLabel int, opts HeadGenOptions) {
+	ref, err := app.Append(
+		0,
+		labels.FromStrings("foo", "bar", "i", fmt.Sprintf("%07d%s", tsLabel, LabelLongSuffix), "j", fmt.Sprintf("%v", tsLabel)),
+		int64(tsLabel)*opts.ScrapeInterval.Milliseconds(),
+		opts.Random.Float64(),
+	)
+	testutil.Ok(t, err)
+
+	for is := 1; is < opts.SamplesPerSeries; is++ {
+		_, err := app.Append(ref, labels.EmptyLabels(), int64(tsLabel+is)*opts.ScrapeInterval.Milliseconds(), opts.Random.Float64())
+		testutil.Ok(t, err)
+	}
+}
+
+func appendHistogramSamples(t testing.TB, app storage.Appender, tsLabel int, opts HeadGenOptions) {
+	sample := &histogram.Histogram{
+		Schema:        0,
+		Count:         20,
+		Sum:           -3.1415,
+		ZeroCount:     12,
+		ZeroThreshold: 0.001,
+		NegativeSpans: []histogram.Span{
+			{Offset: 0, Length: 4},
+			{Offset: 1, Length: 1},
+		},
+		NegativeBuckets: []int64{1, 2, -2, 1, -1},
+	}
+
+	ref, err := app.AppendHistogram(
+		0,
+		labels.FromStrings("foo", "bar", "i", fmt.Sprintf("%07d%s", tsLabel, LabelLongSuffix), "j", fmt.Sprintf("%v", tsLabel)),
+		int64(tsLabel)*opts.ScrapeInterval.Milliseconds(),
+		sample,
+		nil,
+	)
+	testutil.Ok(t, err)
+
+	for is := 1; is < opts.SamplesPerSeries; is++ {
+		_, err := app.AppendHistogram(ref, labels.EmptyLabels(), int64(tsLabel+is)*opts.ScrapeInterval.Milliseconds(), sample, nil)
+		testutil.Ok(t, err)
+	}
+}
+
+func appendFloatHistogramSamples(t testing.TB, app storage.Appender, tsLabel int, opts HeadGenOptions) {
+	sample := &histogram.FloatHistogram{
+		ZeroThreshold: 0.01,
+		ZeroCount:     5.5,
+		Count:         15,
+		Sum:           11.5,
+		PositiveSpans: []histogram.Span{
+			{Offset: -2, Length: 2},
+			{Offset: 1, Length: 3},
+		},
+		PositiveBuckets: []float64{0.5, 0, 1.5, 2, 3.5},
+		NegativeSpans: []histogram.Span{
+			{Offset: 3, Length: 2},
+			{Offset: 3, Length: 2},
+		},
+		NegativeBuckets: []float64{1.5, 0.5, 2.5, 3},
+	}
+
+	ref, err := app.AppendHistogram(
+		0,
+		labels.FromStrings("foo", "bar", "i", fmt.Sprintf("%07d%s", tsLabel, LabelLongSuffix), "j", fmt.Sprintf("%v", tsLabel)),
+		int64(tsLabel)*opts.ScrapeInterval.Milliseconds(),
+		nil,
+		sample,
+	)
+	testutil.Ok(t, err)
+
+	for is := 1; is < opts.SamplesPerSeries; is++ {
+		_, err := app.AppendHistogram(ref, labels.EmptyLabels(), int64(tsLabel+is)*opts.ScrapeInterval.Milliseconds(), nil, sample)
+		testutil.Ok(t, err)
+	}
 }
 
 // SeriesServer is test gRPC storeAPI series server.
@@ -227,6 +338,7 @@ type SeriesCase struct {
 	ExpectedSeries   []*storepb.Series
 	ExpectedWarnings []string
 	ExpectedHints    []hintspb.SeriesResponseHints
+	HintsCompareFunc func(t testutil.TB, expected, actual hintspb.SeriesResponseHints)
 }
 
 // TestServerSeries runs tests against given cases.
@@ -252,18 +364,23 @@ func TestServerSeries(t testutil.TB, store storepb.StoreServer, cases ...*Series
 					// Huge responses can produce unreadable diffs - make it more human readable.
 					if len(c.ExpectedSeries) > 4 {
 						for j := range c.ExpectedSeries {
-							testutil.Equals(t, c.ExpectedSeries[j].Labels, srv.SeriesSet[j].Labels, "%v series chunks mismatch", j)
+							testutil.Equals(t, c.ExpectedSeries[j].Labels, srv.SeriesSet[j].Labels)
 
 							// Check chunks when it is not a skip chunk query
 							if !c.Req.SkipChunks {
 								if len(c.ExpectedSeries[j].Chunks) > 20 {
 									testutil.Equals(t, len(c.ExpectedSeries[j].Chunks), len(srv.SeriesSet[j].Chunks), "%v series chunks number mismatch", j)
 								}
-								testutil.Equals(t, c.ExpectedSeries[j].Chunks, srv.SeriesSet[j].Chunks, "%v series chunks mismatch", j)
+								for ci := range c.ExpectedSeries[j].Chunks {
+									testutil.Equals(t, c.ExpectedSeries[j].Chunks[ci], srv.SeriesSet[j].Chunks[ci], "%v series chunks mismatch %v", j, ci)
+								}
 							}
 						}
 					} else {
-						testutil.Equals(t, c.ExpectedSeries, srv.SeriesSet)
+						testutil.Equals(t, true, len(c.ExpectedSeries) == len(srv.SeriesSet))
+						for i := range c.ExpectedSeries {
+							testutil.Equals(t, c.ExpectedSeries[i], srv.SeriesSet[i])
+						}
 					}
 
 					var actualHints []hintspb.SeriesResponseHints
@@ -272,7 +389,14 @@ func TestServerSeries(t testutil.TB, store storepb.StoreServer, cases ...*Series
 						testutil.Ok(t, types.UnmarshalAny(anyHints, &hints))
 						actualHints = append(actualHints, hints)
 					}
-					testutil.Equals(t, c.ExpectedHints, actualHints)
+					testutil.Equals(t, len(c.ExpectedHints), len(actualHints))
+					for i, hint := range actualHints {
+						if c.HintsCompareFunc == nil {
+							testutil.Equals(t, c.ExpectedHints[i], hint)
+						} else {
+							c.HintsCompareFunc(t, c.ExpectedHints[i], hint)
+						}
+					}
 				}
 			}
 		})

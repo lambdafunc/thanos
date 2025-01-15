@@ -131,7 +131,7 @@ func (w *Compactor) WriteSeries(ctx context.Context, readers []block.Reader, sWr
 			}
 
 			s := set.At()
-			iter := s.Iterator()
+			iter := s.Iterator(nil)
 			for iter.Next() {
 			}
 			if err := iter.Err(); err != nil {
@@ -166,7 +166,7 @@ func compactSeries(ctx context.Context, sReaders ...seriesReader) (symbols index
 		}
 
 		k, v := index.AllPostingsKey()
-		all, err := r.ir.Postings(k, v)
+		all, err := r.ir.Postings(ctx, k, v)
 		if err != nil {
 			return nil, nil, err
 		}
